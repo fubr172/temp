@@ -325,33 +325,35 @@ async def process_log_line(line, server):
         elif match := REGEX_CONNECT.search(line):
             steam_id = match.group(1)
             async with match_data[server_name]["lock"]:
-                match_data[server_name]["players"].add(steam_id)
-                logging.info(f"Игрок {steam_id} подключен к {server_name}")
+                if steam_id not in match_data[server_name]["players"]:
+                    match_data[server_name]["players"].add(steam_id)
+                    logging.info(f"Игрок {steam_id} подключен к {server_name}")
+            await save_initial_stats(server, steam_id)
 
     except Exception as e:
         logging.error(f"Ошибка обработки лога: {e}")
 
 
-async def save_initial_stats(server):
+async def save_initial_stats(server, steam_id):
     try:
         client = mongo_clients[server["name"]]
         db = client[server["db_name"]]
-        players = await db[server["collection_name"]].find({
-            "_id": {"$in": list(match_data[server["name"]]["players"])}
-        }).to_list(length=None)
 
-        initial_stats = {
-            p["_id"]: {
-                "kills": p.get("kills", 0),
-                "revives": p.get("revives", 0),
-                "tech_kills": get_tech_kills(p.get("weapons", {}))
-            } for p in players
-        }
-
-        match_data[server["name"]]["pre_match_stats"] = initial_stats
+        player = await db[server["collection_name"]].find_one({"_id": steam_id})
+        if player:
+            initial_stat = {
+                "kills": player.get("kills", 0),
+                "revives": player.get("revives", 0),
+                "tech_kills": get_tech_kills(player.get("weapons", {}))
+            }
+            async with match_data[server["name"]]["lock"]:
+                match_data[server["name"]]["pre_match_stats"][steam_id] = initial_stat
+            logging.info(f"Сохранена начальная статистика для игрока {steam_id} на сервере {server['name']}")
+        else:
+            logging.warning(f"Игрок {steam_id} не найден в базе данных сервера {server['name']}")
 
     except Exception as e:
-        logging.error(f"Ошибка сохранения начальной статистики: {e}")
+        logging.error(f"Ошибка сохранения начальной статистики для игрока {steam_id} на сервере {server['name']}: {e}")
 
 
 async def calculate_final_stats(server):
