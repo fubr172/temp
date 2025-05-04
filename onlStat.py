@@ -48,39 +48,12 @@ REGEX_CONNECT = re.compile(
     r" \(IP: (\d{1,3}(?:\.\d{1,3}){3}) \| Online IDs: EOS: ([a-f0-9]+) steam: (\d+)\)"
 )
 
-def parse_and_print_log(log_file_path):
-    with open(log_file_path, "r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, 1):
-            line = line.strip()
-
-            if REGEX_MATCH_START.search(line):
-                print(f"[Line {line_number}] Match Start detected:")
-                print(f"  {line}")
-
-            match_end = REGEX_MATCH_END.search(line)
-            if match_end:
-                timestamp, number = match_end.group(1), match_end.group(2)
-                print(f"[Line {line_number}] Match End detected:")
-                print(f"  Timestamp: {timestamp}")
-                print(f"  Number: {number}")
-
-            match_connect = REGEX_CONNECT.search(line)
-            if match_connect:
-                timestamp = match_connect.group(1)
-                number = match_connect.group(2)
-                controller = match_connect.group(3)
-                map_path = match_connect.group(4)
-                ip = match_connect.group(5)
-                eos_id = match_connect.group(6)
-                steam_id = match_connect.group(7)
-                print(f"[Line {line_number}] Player Connect detected:")
-                print(f"  Timestamp: {timestamp}")
-                print(f"  Number: {number}")
-                print(f"  Controller: {controller}")
-                print(f"  Map Path: {map_path}")
-                print(f"  IP: {ip}")
-                print(f"  EOS ID: {eos_id}")
-                print(f"  Steam ID: {steam_id}")
+REGEX_DISCONNECT = re.compile(
+    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}\]"
+    r"\[\d+\]"
+    r"LogNet: UChannel::Close: Sending CloseBunch.*"
+    r"UniqueId: RedpointEOS:([a-f0-9]+)"
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -315,13 +288,15 @@ SERVERS = [
 
 ]
 mongo_clients = {}
+
 match_data = {
     server["name"]: {
         "active": False,
         "start_time": None,
         "players": set(),
+        "disconnected_eos": set(),  # для хранения EOS ID отключившихся игроков
         "pre_match_stats": {},
-        "lock": threading.Lock()  # Добавлен lock для потокобезопасности
+        "lock": asyncio.Lock()
     }
     for server in SERVERS
 }
@@ -368,7 +343,6 @@ async def process_log_line(line, server):
                         "players": set()
                     })
                     logging.info(f"Начало матча на {server_name}")
-                    await save_initial_stats(server)
 
         elif REGEX_MATCH_END.search(line):
             async with match_data[server_name]["lock"]:
@@ -379,6 +353,8 @@ async def process_log_line(line, server):
 
         elif match := REGEX_CONNECT.search(line):
             steam_id = match.group(7)
+            eos_id = match.group(6
+                                 )
             async with match_data[server_name]["lock"]:
                 if match_data[server_name]["active"]:
                     if steam_id not in match_data[server_name]["players"]:
@@ -387,9 +363,10 @@ async def process_log_line(line, server):
                     else:
                         pass
                 else:
-                    logging.debug(f"Игрок {steam_id} подключился до начала матча на {server_name}, статистика не сохраняется")
+                    logging.debug(
+                        f"Игрок {steam_id} подключился до начала матча на {server_name}, статистика не сохраняется")
                     return
-            await save_initial_stats(server, steam_id)
+            await save_initial_stats(server, steam_id, eos_id)
 
     except Exception as e:
         logging.error(f"Ошибка обработки лога: {e}")
@@ -398,7 +375,58 @@ async def process_log_line(line, server):
         logging.error(f"Ошибка обработки лога: {e}")
 
 
-async def save_initial_stats(server, steam_id):
+async def process_log_line(line, server):
+    server_name = server["name"]
+
+    try:
+        if REGEX_MATCH_START.search(line):
+            async with match_data[server_name]["lock"]:
+                if not match_data[server_name]["active"]:
+                    match_data[server_name].update({
+                        "active": True,
+                        "start_time": datetime.now(timezone.utc),
+                        "players": set()
+                    })
+                    logging.info(f"Начало матча на {server_name}")
+                    # Обычно save_initial_stats вызывается при подключении игроков, можно убрать здесь
+                    # await save_initial_stats(server)
+
+        elif REGEX_MATCH_END.search(line):
+            async with match_data[server_name]["lock"]:
+                if match_data[server_name]["active"]:
+                    logging.info(f"Завершение матча на {server_name}")
+                    await calculate_final_stats(server)
+                    match_data[server_name]["active"] = False
+
+        elif match := REGEX_CONNECT.search(line):
+            steam_id = match.group(7)
+            eos_id = match.group(6)
+
+            async with match_data[server_name]["lock"]:
+                if match_data[server_name]["active"]:
+                    if steam_id not in match_data[server_name]["players"]:
+                        match_data[server_name]["players"].add(steam_id)
+                        logging.info(f"Игрок {steam_id} подключен к {server_name}")
+                    else:
+                        pass
+                else:
+                    logging.debug(
+                        f"Игрок {steam_id} подключился до начала матча на {server_name}, статистика не сохраняется")
+                    return
+
+            await save_initial_stats(server, steam_id, eos_id)
+
+        elif match := REGEX_DISCONNECT.search(line):
+            eos_id = match.group(1)
+            async with match_data[server_name]["lock"]:
+                match_data[server_name]["disconnected_eos"].add(eos_id)
+                logging.info(f"Игрок с EOS ID {eos_id} отключился от {server_name}")
+
+    except Exception as e:
+        logging.error(f"Ошибка обработки лога: {e}")
+
+
+async def save_initial_stats(server, steam_id, eos_id=None):
     try:
         client = mongo_clients[server["name"]]
         db = client[server["db_name"]]
@@ -410,7 +438,8 @@ async def save_initial_stats(server, steam_id):
                 "kills": player.get("kills", 0),
                 "revives": player.get("revives", 0),
                 "tech_kills": get_tech_kills(player.get("weapons", {})),
-                "timestamp": datetime.now(timezone.utc)
+                "timestamp": datetime.now(timezone.utc),
+                "eos": eos_id or player.get("eos", None),
             }
         else:
             logging.warning(f"Игрок {steam_id} не найден в базе данных сервера {server['name']}, создаём пустую запись")
@@ -418,7 +447,8 @@ async def save_initial_stats(server, steam_id):
                 "kills": 0,
                 "revives": 0,
                 "tech_kills": 0,
-                "timestamp": datetime.now(timezone.utc)
+                "timestamp": datetime.now(timezone.utc),
+                "eos": eos_id,
             }
 
         await db[server["onl_stats_collection_name"]].update_one(
@@ -431,6 +461,26 @@ async def save_initial_stats(server, steam_id):
 
     except Exception as e:
         logging.error(f"Ошибка сохранения начальной статистики для игрока {steam_id} на сервере {server['name']}: {e}")
+
+
+async def remove_disconnected_players(server):
+    server_name = server["name"]
+    client = mongo_clients[server_name]
+    db = client[server["db_name"]]
+
+    async with match_data[server_name]["lock"]:
+        disconnected = list(match_data[server_name]["disconnected_eos"])
+        if not disconnected:
+            return
+        try:
+            result = await db[server["onl_stats_collection_name"]].delete_many(
+                {"eos": {"$in": disconnected}}
+            )
+            logging.info(f"Удалено {result.deleted_count} записей отключившихся игроков с сервера {server_name}")
+            # Очистить список отключившихся после удаления
+            match_data[server_name]["disconnected_eos"].clear()
+        except Exception as e:
+            logging.error(f"Ошибка удаления отключившихся игроков из БД сервера {server_name}: {e}")
 
 
 async def calculate_final_stats(server):
@@ -451,6 +501,7 @@ async def calculate_final_stats(server):
 
         await send_discord_report(diffs, server)
         await update_onl_stats(db, players, server)
+        await remove_disconnected_players(server)
 
     except Exception as e:
         logging.error(f"Ошибка расчета статистики: {e}")
@@ -528,8 +579,10 @@ async def update_onl_stats(db, players, server):
     except Exception as e:
         logging.error(f"Ошибка обновления статистики: {e}")
 
+
 COMPILED_IGNORED_ROLE_PATTERNS = tuple(re.compile(pat, re.IGNORECASE) for pat in IGNORED_ROLE_PATTERNS)
 vehicle_regex = {key: re.compile(r"([A-Za-z]+)(\d+)", re.IGNORECASE) for key in vehicle_mapping}
+
 
 def get_filtered_vehicle_patterns():
     # Кэшируем результат, чтобы не пересчитывать каждый раз
@@ -549,6 +602,7 @@ def get_filtered_vehicle_patterns():
 
 
 FILTERED_VEHICLE_PATTERNS = get_filtered_vehicle_patterns()
+
 
 def get_tech_kills(weapons):
     patterns = FILTERED_VEHICLE_PATTERNS.values()
@@ -587,6 +641,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    log_path = "path_to_your_log_file.log" 
-    parse_and_print_log(log_path)
     asyncio.run(main())
