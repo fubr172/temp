@@ -15,15 +15,28 @@ import discord
 from discord.ext import commands
 from pymongo import UpdateOne
 
-REGEX_MATCH_START = re.compile(
-    r"^\[([0-9.:-]+)]\[[ 0-9]*]LogWorld: Bringing World \/([A-z0-9]+)\/(?:Maps\/)?([A-z0-9-]+)\/(?:.+\/)?([A-z0-9-]+)(?:\.[A-z0-9-]+)"
+REGEX_MATCH_START = pattern = re.compile(
+    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}\]"    
+    r"\[\d+\]"                                            
+    r"LogWorld: Bringing World .+ up for play \(max tick rate \d+\) at \d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}"
 )
 REGEX_MATCH_END = re.compile(
-    r"^\[([0-9.:-]+)]\[[ 0-9]*]LogGameState: Match State Changed from InProgress to WaitingPostMatch"
+    r"\["                                
+    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"  
+    r"\]\["                              
+    r"(\d+)"                              
+    r"\]LogGameState: Match State Changed from InProgress to WaitingPostMatch"
 )
 REGEX_CONNECT = re.compile(
-    r"^\[([0-9.:-]+)]\[[ 0-9]*]LogSquad: PostLogin: NewPlayer: [^\s]+ .+PersistentLevel\.([^\s]+) \(IP: ([\d.]+) \| "
-    r"Online IDs: EOS: ([0-9a-f]{32}) steam: (\d+)\)"
+    r"\["                           
+    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
+    r"\]\["                           
+    r"(\d+)"                           
+    r"\]LogSquad: PostLogin: NewPlayer: " 
+    r"([\w_]+)"                  
+    r" "                   
+    r"([^\s]+)"                   
+    r" \(IP: (\d{1,3}(?:\.\d{1,3}){3}) \| Online IDs: EOS: ([a-f0-9]+) steam: (\d+)\)"
 )
 
 
