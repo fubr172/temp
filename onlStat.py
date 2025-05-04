@@ -404,23 +404,30 @@ async def save_initial_stats(server, steam_id):
         db = client[server["db_name"]]
 
         player = await db[server["collection_name"]].find_one({"_id": steam_id})
+
         if player:
             initial_stat = {
                 "kills": player.get("kills", 0),
                 "revives": player.get("revives", 0),
                 "tech_kills": get_tech_kills(player.get("weapons", {})),
-                "timestamp": datetime.now(timezone.utc)  # можно добавить время записи
+                "timestamp": datetime.now(timezone.utc)
+            }
+        else:
+            logging.warning(f"Игрок {steam_id} не найден в базе данных сервера {server['name']}, создаём пустую запись")
+            initial_stat = {
+                "kills": 0,
+                "revives": 0,
+                "tech_kills": 0,
+                "timestamp": datetime.now(timezone.utc)
             }
 
-            result = await db[server["onl_stats_collection_name"]].update_one(
-                {"_id": steam_id},
-                {"$set": initial_stat},
-                upsert=True
-            )
+        await db[server["onl_stats_collection_name"]].update_one(
+            {"_id": steam_id},
+            {"$set": initial_stat},
+            upsert=True
+        )
 
-            logging.info(f"Начальная статистика игрока {steam_id} сохранена в БД сервера {server['name']}")
-        else:
-            logging.warning(f"Игрок {steam_id} не найден в базе данных сервера {server['name']}")
+        logging.info(f"Начальная статистика игрока {steam_id} сохранена в БД сервера {server['name']}")
 
     except Exception as e:
         logging.error(f"Ошибка сохранения начальной статистики для игрока {steam_id} на сервере {server['name']}: {e}")
