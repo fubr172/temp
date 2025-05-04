@@ -399,11 +399,17 @@ async def save_initial_stats(server, steam_id):
             initial_stat = {
                 "kills": player.get("kills", 0),
                 "revives": player.get("revives", 0),
-                "tech_kills": get_tech_kills(player.get("weapons", {}))
+                "tech_kills": get_tech_kills(player.get("weapons", {})),
+                "timestamp": datetime.now(timezone.utc)  # можно добавить время записи
             }
-            async with match_data[server["name"]]["lock"]:
-                match_data[server["name"]]["pre_match_stats"][steam_id] = initial_stat
-            logging.info(f"Сохранена начальная статистика для игрока {steam_id} на сервере {server['name']}")
+
+            result = await db[server["onl_stats_collection_name"]].update_one(
+                {"_id": steam_id},
+                {"$set": initial_stat},
+                upsert=True
+            )
+
+            logging.info(f"Начальная статистика игрока {steam_id} сохранена в БД сервера {server['name']}")
         else:
             logging.warning(f"Игрок {steam_id} не найден в базе данных сервера {server['name']}")
 
