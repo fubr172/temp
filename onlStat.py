@@ -371,60 +371,6 @@ async def process_log_line(line, server):
     except Exception as e:
         logging.error(f"Ошибка обработки лога: {e}")
 
-    except Exception as e:
-        logging.error(f"Ошибка обработки лога: {e}")
-
-
-async def process_log_line(line, server):
-    server_name = server["name"]
-
-    try:
-        if REGEX_MATCH_START.search(line):
-            async with match_data[server_name]["lock"]:
-                if not match_data[server_name]["active"]:
-                    match_data[server_name].update({
-                        "active": True,
-                        "start_time": datetime.now(timezone.utc),
-                        "players": set()
-                    })
-                    logging.info(f"Начало матча на {server_name}")
-                    # Обычно save_initial_stats вызывается при подключении игроков, можно убрать здесь
-                    # await save_initial_stats(server)
-
-        elif REGEX_MATCH_END.search(line):
-            async with match_data[server_name]["lock"]:
-                if match_data[server_name]["active"]:
-                    logging.info(f"Завершение матча на {server_name}")
-                    await calculate_final_stats(server)
-                    match_data[server_name]["active"] = False
-
-        elif match := REGEX_CONNECT.search(line):
-            steam_id = match.group(7)
-            eos_id = match.group(6)
-
-            async with match_data[server_name]["lock"]:
-                if match_data[server_name]["active"]:
-                    if steam_id not in match_data[server_name]["players"]:
-                        match_data[server_name]["players"].add(steam_id)
-                        logging.info(f"Игрок {steam_id} подключен к {server_name}")
-                    else:
-                        pass
-                else:
-                    logging.debug(
-                        f"Игрок {steam_id} подключился до начала матча на {server_name}, статистика не сохраняется")
-                    return
-
-            await save_initial_stats(server, steam_id, eos_id)
-
-        elif match := REGEX_DISCONNECT.search(line):
-            eos_id = match.group(1)
-            async with match_data[server_name]["lock"]:
-                match_data[server_name]["disconnected_eos"].add(eos_id)
-                logging.info(f"Игрок с EOS ID {eos_id} отключился от {server_name}")
-
-    except Exception as e:
-        logging.error(f"Ошибка обработки лога: {e}")
-
 
 async def save_initial_stats(server, steam_id, eos_id=None):
     try:
