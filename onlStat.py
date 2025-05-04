@@ -380,7 +380,6 @@ async def process_log_line(line, server):
         elif match := REGEX_CONNECT.search(line):
             steam_id = match.group(7)
             async with match_data[server_name]["lock"]:
-                # Сохраняем статистику только если матч активен
                 if match_data[server_name]["active"]:
                     if steam_id not in match_data[server_name]["players"]:
                         match_data[server_name]["players"].add(steam_id)
