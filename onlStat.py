@@ -15,30 +15,72 @@ import discord
 from discord.ext import commands
 from pymongo import UpdateOne
 
-REGEX_MATCH_START = pattern = re.compile(
-    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}\]"    
-    r"\[\d+\]"                                            
-    r"LogWorld: Bringing World .+ up for play \(max tick rate \d+\) at \d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}"
+REGEX_MATCH_START = re.compile(
+    r"\["
+    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}"
+    r"\]"
+    r"\["
+    r"\d+"
+    r"\]"
+    r"LogWorld: Bringing World .+ up for play \(max tick rate \d+\) at "
+    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}"
 )
+
 REGEX_MATCH_END = re.compile(
-    r"\["                                
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"  
-    r"\]\["                              
-    r"(\d+)"                              
-    r"\]LogGameState: Match State Changed from InProgress to WaitingPostMatch"
-)
-REGEX_CONNECT = re.compile(
-    r"\["                           
+    r"\["
     r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
-    r"\]\["                           
-    r"(\d+)"                           
-    r"\]LogSquad: PostLogin: NewPlayer: " 
-    r"([\w_]+)"                  
-    r" "                   
-    r"([^\s]+)"                   
+    r"\]\["
+    r"(\d+)"
+    r"\]"
+    r"LogGameState: Match State Changed from InProgress to WaitingPostMatch"
+)
+
+REGEX_CONNECT = re.compile(
+    r"\["
+    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
+    r"\]\["
+    r"(\d+)"
+    r"\]"
+    r"LogSquad: PostLogin: NewPlayer: "
+    r"([\w_]+)"
+    r" "
+    r"([^\s]+)"
     r" \(IP: (\d{1,3}(?:\.\d{1,3}){3}) \| Online IDs: EOS: ([a-f0-9]+) steam: (\d+)\)"
 )
 
+def parse_and_print_log(log_file_path):
+    with open(log_file_path, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, 1):
+            line = line.strip()
+
+            if REGEX_MATCH_START.search(line):
+                print(f"[Line {line_number}] Match Start detected:")
+                print(f"  {line}")
+
+            match_end = REGEX_MATCH_END.search(line)
+            if match_end:
+                timestamp, number = match_end.group(1), match_end.group(2)
+                print(f"[Line {line_number}] Match End detected:")
+                print(f"  Timestamp: {timestamp}")
+                print(f"  Number: {number}")
+
+            match_connect = REGEX_CONNECT.search(line)
+            if match_connect:
+                timestamp = match_connect.group(1)
+                number = match_connect.group(2)
+                controller = match_connect.group(3)
+                map_path = match_connect.group(4)
+                ip = match_connect.group(5)
+                eos_id = match_connect.group(6)
+                steam_id = match_connect.group(7)
+                print(f"[Line {line_number}] Player Connect detected:")
+                print(f"  Timestamp: {timestamp}")
+                print(f"  Number: {number}")
+                print(f"  Controller: {controller}")
+                print(f"  Map Path: {map_path}")
+                print(f"  IP: {ip}")
+                print(f"  EOS ID: {eos_id}")
+                print(f"  Steam ID: {steam_id}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -523,4 +565,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    log_path = "path_to_your_log_file.log" 
+    parse_and_print_log(log_path)
     asyncio.run(main())
