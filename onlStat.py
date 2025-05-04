@@ -532,18 +532,15 @@ async def send_discord_report(diffs, server):
             ("Топ-3 по ревайвам", "revives_diff"),
             ("Топ-3 по технике", "tech_kills_diff")
         ]:
-            sorted_diffs = sorted(
-                [d for d in diffs if d[key] > 0],
-                key=lambda x: x[key],
-                reverse=True
-            )[:3]
+            filtered_diffs = [d for d in diffs if isinstance(d, dict) and d.get(key, 0) > 0]
+            sorted_diffs = sorted(filtered_diffs, key=lambda x: x[key], reverse=True)[:3]
 
             if sorted_diffs:
                 embed = discord.Embed(title=title)
                 for i, diff in enumerate(sorted_diffs, 1):
                     embed.add_field(
-                        name=f"{i}. {diff['name']}",
-                        value=f"+{diff[key]}",
+                        name=f"{i}. {diff.get('name', 'Unknown')}",
+                        value=f"+{diff.get(key, 0)}",
                         inline=False
                     )
                 embeds.append(embed)
