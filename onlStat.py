@@ -378,12 +378,22 @@ async def process_log_line(line, server):
                     match_data[server_name]["active"] = False
 
         elif match := REGEX_CONNECT.search(line):
-            steam_id = match.group(1)
+            steam_id = match.group(7)
             async with match_data[server_name]["lock"]:
-                if steam_id not in match_data[server_name]["players"]:
-                    match_data[server_name]["players"].add(steam_id)
-                    logging.info(f"Игрок {steam_id} подключен к {server_name}")
+                # Сохраняем статистику только если матч активен
+                if match_data[server_name]["active"]:
+                    if steam_id not in match_data[server_name]["players"]:
+                        match_data[server_name]["players"].add(steam_id)
+                        logging.info(f"Игрок {steam_id} подключен к {server_name}")
+                    else:
+                        pass
+                else:
+                    logging.debug(f"Игрок {steam_id} подключился до начала матча на {server_name}, статистика не сохраняется")
+                    return
             await save_initial_stats(server, steam_id)
+
+    except Exception as e:
+        logging.error(f"Ошибка обработки лога: {e}")
 
     except Exception as e:
         logging.error(f"Ошибка обработки лога: {e}")
