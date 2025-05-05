@@ -484,14 +484,11 @@ class SquadLogHandler(FileSystemEventHandler):
         self.log_path = log_path
         self.server = server
         self._position = 0
-        self._queue = asyncio.Queue()
         self._active = True
         self._init_position()
-        self._start_processing_task()
         super().__init__()
 
     def _init_position(self):
-        """Инициализация начальной позиции чтения лога"""
         try:
             self._position = os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
             logging.info(f"Инициализировано чтение лога {self.log_path} с позиции {self._position}")
@@ -499,51 +496,18 @@ class SquadLogHandler(FileSystemEventHandler):
             logging.error(f"Ошибка определения размера лог-файла: {e}")
             self._position = 0
 
-    def _start_processing_task(self):
-        """Запуск фоновой задачи обработки логов"""
-        try:
-            self._task = asyncio.run_coroutine_threadsafe(self._process_queue(), bot.loop)
-            logging.info(f"Запущен обработчик логов для сервера {self.server['name']}")
-        except Exception as e:
-            logging.error(f"Ошибка запуска обработчика логов: {e}")
-            raise
-
     def on_modified(self, event):
-        """Обработчик изменений файла"""
         if event.src_path == self.log_path and self._active:
-            try:
-                bot.loop.call_soon_threadsafe(self._queue.put_nowait, True)
-                logging.debug(f"Обнаружено изменение лог-файла {self.log_path}")
-            except Exception as e:
-                logging.error(f"Ошибка постановки задачи в очередь: {e}")
+            asyncio.run_coroutine_threadsafe(self._process_log_update(), bot.loop)
 
-    async def _process_queue(self):
-        """Основной цикл обработки событий"""
-        while self._active:
-            try:
-                await self._queue.get()
-                await asyncio.sleep(0.2)  # Задержка для группировки событий
-                await self._clear_queue()
-                await self.process_new_lines()
-            except Exception as e:
-                logging.error(f"Ошибка в основном цикле обработки: {e}")
-                await asyncio.sleep(1)
+    async def _process_log_update(self):
+        try:
+            await asyncio.sleep(0.2)  # Дебаунс
+            await self._process_new_lines()
+        except Exception as e:
+            logging.error(f"Ошибка обработки лога: {e}")
 
-    async def _clear_queue(self):
-        """Очистка очереди от накопившихся событий"""
-        cleared = 0
-        while not self._queue.empty():
-            try:
-                self._queue.get_nowait()
-                self._queue.task_done()
-                cleared += 1
-            except Exception:
-                break
-        if cleared > 0:
-            logging.debug(f"Очищено {cleared} событий из очереди")
-
-    async def process_new_lines(self):
-        """Обработка новых строк в лог-файле"""
+    async def _process_new_lines(self):
         try:
             if not os.path.exists(self.log_path):
                 logging.warning(f"Лог-файл {self.log_path} не найден")
@@ -554,24 +518,16 @@ class SquadLogHandler(FileSystemEventHandler):
                 lines = await f.readlines()
                 self._position = f.tell()
 
-                if lines:
-                    for line in lines:
-                        if line.strip():
-                            await process_log_line(line.strip(), self.server)
+                for line in lines:
+                    if line.strip():
+                        await process_log_line(line.strip(), self.server)
 
         except Exception as e:
             logging.error(f"Ошибка чтения лог-файла: {e}")
 
     def shutdown(self):
-        """Корректное завершение работы обработчика"""
         logging.info(f"Остановка обработчика логов для {self.server['name']}")
         self._active = False
-        try:
-            if self._task:
-                self._task.cancel()
-                logging.info("Фоновая задача остановлена")
-        except Exception as e:
-            logging.error(f"Ошибка при остановке задачи: {e}")
 
 
 async def process_log_line(line, server):
@@ -889,11 +845,7 @@ async def main():
     # Инициализация MongoDB
     for server in SERVERS:
         try:
-            client = AsyncIOMotorClient(
-                server["mongo_uri"],
-                serverSelectionTimeoutMS=5000,
-                connectTimeoutMS=3000
-            )
+            client = AsyncIOMotorClient(server["mongo_uri"])
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
             logging.info(f"MongoDB подключен: {server['name']}")
@@ -901,12 +853,12 @@ async def main():
             logging.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
             continue
 
-    # Запуск наблюдателей логов в отдельном потоке
+    # Запуск наблюдателей логов
     observers = []
     for server in SERVERS:
         try:
-            observer = Observer()
             handler = SquadLogHandler(server["logFilePath"], server)
+            observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
             
             # Запуск в отдельном потоке
@@ -914,7 +866,7 @@ async def main():
             observer_thread.daemon = True
             observer_thread.start()
             
-            observers.append((observer, observer_thread))
+            observers.append((observer, handler))
             logging.info(f"Мониторинг логов запущен: {server['name']}")
         except Exception as e:
             logging.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
@@ -922,20 +874,15 @@ async def main():
     # Запуск бота Discord
     try:
         logging.info("Запуск Discord бота...")
-        await bot.start('YOUR_BOT_TOKEN_HERE')  # Замените на реальный токен
-    except discord.LoginFailure:
-        logging.critical("Неверный токен Discord бота")
+        await bot.start('YOUR_VALID_TOKEN_HERE')
     except Exception as e:
         logging.critical(f"Ошибка Discord бота: {str(e)}")
     finally:
         # Корректное завершение
-        for observer, thread in observers:
+        for observer, handler in observers:
+            handler.stop()
             observer.stop()
-            thread.join()
-        
-        # Закрытие соединений MongoDB
-        for client in mongo_clients.values():
-            client.close()
+            observer.join()
         
         logging.info("Приложение завершено")
 
