@@ -326,6 +326,7 @@ async def create_initial_match_record(server):
             "server_name": server["name"],
             "active": True
         })
+        logging.info(f'Запись о матче уже была создана(ID матча: {active_match["id"]})')
 
         if active_match:
             logging.warning(
@@ -353,6 +354,7 @@ async def create_initial_match_record(server):
     except Exception as e:
         logging.error(f"Ошибка при создании начальной записи матча для сервера {server['name']}: {e}")
         return None
+
 
 # Функция для старта матча
 async def start_match(server):
@@ -784,7 +786,7 @@ async def send_discord_report(diffs, server):
                 for idx, player in enumerate(top_players, 1):
                     embed.add_field(
                         name=f"{idx}. {player.get('name', 'Неизвестный')}",
-                        value=f"```diff\n+ {player.get(key, 0)}\n```",
+                        value=f"```diff\n {player.get(key, 0)}\n```",
                         inline=False
                     )
                 embed.set_footer(text=f"Отчёт: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
@@ -966,12 +968,6 @@ async def main():
     logger = setup_logging()
     logger.info("Инициализация приложения")
 
-    for server in SERVERS:
-        try:
-            await create_initial_match_record(server)
-        except Exception as e:
-            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
-
     # Инициализация MongoDB
     for server in SERVERS:
         try:
@@ -1020,6 +1016,12 @@ async def main():
         except Exception as e:
             logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
 
+    for server in SERVERS:
+        try:
+            await create_initial_match_record(server)
+        except Exception as e:
+            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
+
     # Настройка Discord бота
     try:
         logger.debug("Инициализация Discord бота")
@@ -1032,7 +1034,8 @@ async def main():
         async def on_ready():
             logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
 
-        # Токен должен храниться в переменных окружения или конфиг-файле
+            # Токен должен храниться в переменных окружения или конфиг-файле
+
         DISCORD_TOKEN = os.getenv(
             'DISCORD_TOKEN')  # Используйте переменные окружения
 
