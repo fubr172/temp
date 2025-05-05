@@ -901,15 +901,20 @@ async def main():
             logging.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
             continue
 
-    # Запуск наблюдателей логов
+    # Запуск наблюдателей логов в отдельном потоке
     observers = []
     for server in SERVERS:
         try:
             observer = Observer()
             handler = SquadLogHandler(server["logFilePath"], server)
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
-            observer.start()
-            observers.append(observer)
+            
+            # Запуск в отдельном потоке
+            observer_thread = threading.Thread(target=observer.start)
+            observer_thread.daemon = True
+            observer_thread.start()
+            
+            observers.append((observer, observer_thread))
             logging.info(f"Мониторинг логов запущен: {server['name']}")
         except Exception as e:
             logging.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
@@ -917,14 +922,21 @@ async def main():
     # Запуск бота Discord
     try:
         logging.info("Запуск Discord бота...")
-        await bot.start('')
+        await bot.start('YOUR_BOT_TOKEN_HERE')  # Замените на реальный токен
+    except discord.LoginFailure:
+        logging.critical("Неверный токен Discord бота")
     except Exception as e:
         logging.critical(f"Ошибка Discord бота: {str(e)}")
     finally:
         # Корректное завершение
-        for observer in observers:
+        for observer, thread in observers:
             observer.stop()
-            observer.join()
+            thread.join()
+        
+        # Закрытие соединений MongoDB
+        for client in mongo_clients.values():
+            client.close()
+        
         logging.info("Приложение завершено")
 
 if __name__ == "__main__":
