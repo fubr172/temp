@@ -480,11 +480,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 class SquadLogHandler(FileSystemEventHandler):
-    def __init__(self, log_path, server):
+    def __init__(self, log_path, server, loop):
         self.log_path = log_path
         self.server = server
         self._position = 0
         self._active = True
+        self.loop = loop
         self._init_position()
         super().__init__()
 
@@ -498,7 +499,7 @@ class SquadLogHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if event.src_path == self.log_path and self._active:
-            asyncio.create_task(self._process_log_update())
+            asyncio.run_coroutine_threadsafe(self._process_log_update(), self.loop)
 
     async def _process_log_update(self):
         try:
@@ -513,36 +514,9 @@ class SquadLogHandler(FileSystemEventHandler):
                 logging.warning(f"Лог-файл {self.log_path} не найден")
                 return
 
-            # Получаем текущий размер файла синхронно
             current_size = os.path.getsize(self.log_path)
             if current_size < self._position:
-                # Файл был перезаписан (ротирован)
                 self._position = 0
-
-            async with aiofiles.open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                await f.seek(self._position)
-                lines = await f.readlines()
-                self._position = f.tell()
-
-                for line in lines:
-                    line = line.strip()
-                    if line:
-                        try:
-                            await process_log_line(line, self.server)
-                        except Exception as e:
-                            logging.error(f"Ошибка обработки строки лога: {e}")
-
-        except Exception as e:
-            logging.error(f"Ошибка чтения лог-файла {self.log_path}: {e}")
-
-    def shutdown(self):
-        self._active = False
-
-    async def _process_new_lines(self):
-        try:
-            if not os.path.exists(self.log_path):
-                logging.warning(f"Лог-файл {self.log_path} не найден")
-                return
 
             async with aiofiles.open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
                 await f.seek(self._position)
@@ -552,14 +526,11 @@ class SquadLogHandler(FileSystemEventHandler):
                 for line in lines:
                     if line.strip():
                         await process_log_line(line.strip(), self.server)
-
         except Exception as e:
             logging.error(f"Ошибка чтения лог-файла: {e}")
 
     def shutdown(self):
-        logging.info(f"Остановка обработчика логов для {self.server['name']}")
         self._active = False
-
 
 async def process_log_line(line, server):
     server_name = server["name"]
@@ -881,35 +852,45 @@ async def main():
             logging.error(f"Ошибка MongoDB ({server['name']}): {e}")
             continue
 
+    # Получаем текущий event loop
+    loop = asyncio.get_running_loop()
+
     # Запуск наблюдателей логов
     observers = []
     for server in SERVERS:
         try:
-            handler = SquadLogHandler(server["logFilePath"], server)
+            handler = SquadLogHandler(server["logFilePath"], server, loop)
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
-            observer.start()
-            observers.append(observer)
+            
+            # Запуск в отдельном потоке
+            observer_thread = threading.Thread(target=observer.start)
+            observer_thread.daemon = True
+            observer_thread.start()
+            
+            observers.append((observer, observer_thread))
             logging.info(f"Мониторинг логов запущен: {server['name']}")
         except Exception as e:
             logging.error(f"Ошибка наблюдателя ({server['name']}): {e}")
 
-    # Запуск бота Discord с правильными интентами
+    # Настройка интентов Discord
     intents = discord.Intents.default()
-    intents.message_content = True  # Если нужно читать содержимое сообщений
+    intents.message_content = True
 
+    # Запуск бота Discord
     try:
         logging.info("Запуск Discord бота...")
-        await bot.start('YOUR_BOT_TOKEN_HERE')  # Замените на реальный токен
+        await bot.start('YOUR_BOT_TOKEN_HERE')
     except discord.LoginFailure:
         logging.critical("Неверный токен Discord бота")
     except Exception as e:
         logging.critical(f"Ошибка Discord бота: {e}")
     finally:
         # Корректное завершение
-        for observer in observers:
+        for observer, thread in observers:
+            handler.shutdown()
             observer.stop()
-            observer.join()
+            thread.join()
         
         logging.info("Приложение завершено")
 
@@ -919,3 +900,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
+        logging.critical(f"Критическая ошибка: {e}")
