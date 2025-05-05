@@ -321,22 +321,21 @@ async def create_initial_match_record(server):
     try:
         match_collection = await get_match_collection(server)
 
-        # Проверяем, есть ли уже активный матч (на случай перезапуска бота)
-        active_match = await match_collection.find_one({
-            "server_name": server["name"],
-            "active": True
+        existing_match = await match_collection.find_one({
+            "server_name": server["name"]
         })
-        logging.info(f'Запись о матче уже была создана(ID матча: {active_match["id"]})')
 
-        if active_match:
-            logging.warning(
-                f"На сервере {server['name']} уже есть активный матч (ID: {active_match['_id']}). Деактивируем его.")
-            await match_collection.update_one(
-                {"_id": active_match["_id"]},
-                {"$set": {"active": False}}
-            )
+        if existing_match:
+            if existing_match.get("active", False):
+                await match_collection.update_one(
+                    {"_id": existing_match["_id"]},
+                    {"$set": {"active": False}}
+                )
+                logging.info(f"Деактивирована активная запись матча для сервера {server['name']} (ID: {existing_match['_id']})")
+            else:
+                logging.info(f"Используется существующая запись матча для сервера {server['name']} (ID: {existing_match['_id']})")
+            return existing_match["_id"]
 
-        # Создаем новую запись с active=False
         match_doc = {
             "server_name": server["name"],
             "active": False,
