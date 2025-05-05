@@ -830,76 +830,122 @@ def get_tech_kills(weapons):
     )
 
 
-async def main():
-    # Настройка расширенного логирования
-    def setup_logging():
+def setup_logging():
+    """Настройка комплексного логирования в консоль и файл с обработкой ошибок"""
+    try:
+        # Создаем директорию для логов, если её нет
+        log_dir = Path("logs")
+        try:
+            log_dir.mkdir(exist_ok=True, mode=0o755)
+        except Exception as e:
+            print(f"Не удалось создать директорию логов: {e}", file=sys.stderr)
+            raise
+
         log_format = "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
         date_format = "%Y-%m-%d %H:%M:%S"
         formatter = logging.Formatter(log_format, datefmt=date_format)
         
         logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG)  # Захватываем всё от DEBUG
+        logger.setLevel(logging.DEBUG)
         
-        # Консольный вывод (INFO и выше)
+        # 1. Консольный вывод
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(formatter)
-        
-        # Файловый вывод (DEBUG и выше)
-        file_handler = RotatingFileHandler(
-            filename='bot_application.log',
-            maxBytes=10*1024*1024,  # 10 MB
-            backupCount=5,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
-        
         logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
+        
+        # 2. Файловый вывод с обработкой ошибок
+        log_file = log_dir / "application.log"
+        try:
+            file_handler = RotatingFileHandler(
+                filename=log_file,
+                maxBytes=10*1024*1024,
+                backupCount=5,
+                encoding='utf-8'
+            )
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except PermissionError:
+            logger.error(f"Нет прав на запись в файл логов: {log_file}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Ошибка при настройке файлового логирования: {e}", exc_info=True)
         
         # Перехват необработанных исключений
-        def handle_exception(exc_type, exc_value, exc_traceback):
-            if issubclass(exc_type, KeyboardInterrupt):
-                sys.__excepthook__(exc_type, exc_value, exc_traceback)
-                return
-            
-            logger.critical("Необработанное исключение:", exc_info=(exc_type, exc_value, exc_traceback))
+        sys.excepthook = lambda t, v, tb: logger.critical("Необработанное исключение", exc_info=(t, v, tb))
         
-        sys.excepthook = handle_exception
+        return logger
     
-    setup_logging()
-    logging.info("Настройка логирования завершена")
+    except Exception as e:
+        print(f"КРИТИЧЕСКАЯ ОШИБКА при настройке логирования: {e}", file=sys.stderr)
+        raise
 
-    # Инициализация MongoDB с подробным логированием
+async def verify_log_file(log_path):
+    """Проверка доступности файла логов с созданием при необходимости"""
+    try:
+        path = Path(log_path)
+        if not path.exists():
+            try:
+                path.touch(mode=0o644)
+                logging.info(f"Создан новый файл логов: {log_path}")
+                return True
+            except Exception as e:
+                logging.error(f"Не удалось создать файл логов {log_path}: {e}", exc_info=True)
+                return False
+        
+        if not path.is_file():
+            logging.error(f"Указанный путь логов не является файлом: {log_path}")
+            return False
+        
+        # Проверка прав доступа
+        if not os.access(log_path, os.R_OK | os.W_OK):
+            logging.error(f"Недостаточно прав для доступа к файлу логов: {log_path}")
+            return False
+            
+        return True
+    
+    except Exception as e:
+        logging.error(f"Ошибка проверки файла логов {log_path}: {e}", exc_info=True)
+        return False
+
+async def main():
+    # Инициализация логирования
+    logger = setup_logging()
+    logger.info("Инициализация приложения")
+
+    # Инициализация MongoDB
     for server in SERVERS:
         try:
-            logging.debug(f"Попытка подключения к MongoDB: {server['name']}")
-            client = AsyncIOMotorClient(server["mongo_uri"], serverSelectionTimeoutMS=5000)
+            logger.debug(f"Подключение к MongoDB: {server['name']}")
+            client = AsyncIOMotorClient(
+                server["mongo_uri"],
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=30000
+            )
             
             # Проверка подключения
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
             
-            # Проверка существования коллекций
+            # Проверка коллекций
             db = client[server["db_name"]]
             collections = await db.list_collection_names()
-            logging.info(f"MongoDB подключен: {server['name']}. Доступные коллекции: {collections}")
+            logger.info(f"MongoDB подключен: {server['name']}. Коллекции: {collections}")
             
         except Exception as e:
-            logging.error(f"Ошибка MongoDB ({server['name']}):", exc_info=True)
+            logger.error(f"Ошибка MongoDB ({server['name']}):", exc_info=True)
             continue
 
-    # Запуск наблюдателей логов с обработкой ошибок
+    # Запуск наблюдателей логов
     observers = []
     for server in SERVERS:
         try:
-            logging.debug(f"Инициализация наблюдателя для: {server['name']}")
-            
-            if not os.path.exists(server["logFilePath"]):
-                logging.warning(f"Файл логов не найден: {server['logFilePath']}")
+            if not await verify_log_file(server["logFilePath"]):
                 continue
                 
+            logger.debug(f"Запуск наблюдателя для: {server['name']}")
+            
             handler = SquadLogHandler(server["logFilePath"], server, asyncio.get_running_loop())
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
@@ -912,14 +958,14 @@ async def main():
             observer_thread.start()
             
             observers.append((observer, observer_thread, handler))
-            logging.info(f"Мониторинг логов запущен: {server['name']}")
+            logger.info(f"Мониторинг логов запущен: {server['name']}")
             
         except Exception as e:
-            logging.error(f"Ошибка при запуске наблюдателя ({server['name']}):", exc_info=True)
+            logger.error(f"Ошибка наблюдателя ({server['name']}):", exc_info=True)
 
-    # Настройка и запуск Discord бота
+    # Настройка Discord бота
     try:
-        logging.debug("Настройка Discord бота...")
+        logger.debug("Инициализация Discord бота")
         intents = discord.Intents.default()
         intents.message_content = True
         
@@ -927,49 +973,44 @@ async def main():
         
         @bot.event
         async def on_ready():
-            logging.info(f"Бот готов: {bot.user.name} (ID: {bot.user.id})")
+            logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
         
         @bot.event
         async def on_error(event, *args, **kwargs):
-            logging.error(f"Ошибка в событии Discord {event}:", exc_info=True)
+            logger.error(f"Ошибка в событии {event}:", exc_info=True)
         
-        logging.info("Запуск Discord бота...")
-        await bot.start('YOUR_DISCORD_TOKEN')  # Всегда используйте переменные окружения для токенов!
+        logger.info("Запуск Discord бота")
+        await bot.start(os.getenv('DISCORD_TOKEN'))  # Токен из переменных окружения
         
     except discord.LoginFailure:
-        logging.critical("Неверный токен Discord бота", exc_info=True)
+        logger.critical("Ошибка аутентификации Discord", exc_info=True)
     except discord.DiscordException as e:
-        logging.critical(f"Ошибка Discord API: {e}", exc_info=True)
+        logger.critical(f"Ошибка Discord API: {e}", exc_info=True)
     except Exception as e:
-        logging.critical("Неожиданная ошибка Discord бота:", exc_info=True)
+        logger.critical("Фатальная ошибка Discord бота:", exc_info=True)
     finally:
-        # Корректное завершение всех компонентов
-        logging.info("Начало процедуры завершения...")
+        logger.info("Завершение работы приложения")
         
-        try:
-            # Остановка наблюдателей
-            for observer, thread, handler in observers:
-                try:
-                    handler.shutdown()
-                    observer.stop()
-                    thread.join(timeout=5)
-                    logging.info(f"Наблюдатель остановлен: {handler.server['name']}")
-                except Exception as e:
-                    logging.error(f"Ошибка при остановке наблюдателя:", exc_info=True)
-            
-            # Закрытие подключений MongoDB
-            for name, client in mongo_clients.items():
-                try:
-                    client.close()
-                    await asyncio.sleep(0.1)
-                    logging.info(f"MongoDB подключение закрыто: {name}")
-                except Exception as e:
-                    logging.error(f"Ошибка при закрытии MongoDB:", exc_info=True)
-                    
-        except Exception as e:
-            logging.critical("Ошибка при завершении:", exc_info=True)
-        finally:
-            logging.info("Приложение завершено")
+        # Остановка наблюдателей
+        for observer, thread, handler in observers:
+            try:
+                handler.shutdown()
+                observer.stop()
+                thread.join(timeout=5)
+                logger.info(f"Наблюдатель остановлен: {handler.server['name']}")
+            except Exception as e:
+                logger.error("Ошибка остановки наблюдателя:", exc_info=True)
+        
+        # Закрытие подключений MongoDB
+        for name, client in mongo_clients.items():
+            try:
+                client.close()
+                await asyncio.sleep(0.1)
+                logger.info(f"MongoDB отключен: {name}")
+            except Exception as e:
+                logger.error("Ошибка закрытия MongoDB:", exc_info=True)
+        
+        logger.info("Приложение завершено")
 
 if __name__ == "__main__":
     try:
@@ -977,4 +1018,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
-        logging.critical("Критическая ошибка при запуске:", exc_info=True)
+        logging.critical("Критическая ошибка:", exc_info=True)
+        sys.exit(1)
