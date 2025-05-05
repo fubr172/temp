@@ -1,6 +1,5 @@
 import asyncio
 import aiofiles
-import motor
 import pymongo
 import threading
 import logging
@@ -318,13 +317,59 @@ async def get_match_collection(server):
         raise
 
 
+async def create_initial_match_record(server):
+    try:
+        match_collection = await get_match_collection(server)
+
+        # Проверяем, есть ли уже активный матч (на случай перезапуска бота)
+        active_match = await match_collection.find_one({
+            "server_name": server["name"],
+            "active": True
+        })
+
+        if active_match:
+            logging.warning(
+                f"На сервере {server['name']} уже есть активный матч (ID: {active_match['_id']}). Деактивируем его.")
+            await match_collection.update_one(
+                {"_id": active_match["_id"]},
+                {"$set": {"active": False}}
+            )
+
+        # Создаем новую запись с active=False
+        match_doc = {
+            "server_name": server["name"],
+            "active": False,
+            "start_time": datetime.now(timezone.utc),
+            "players": [],
+            "disconnected_players": [],
+            "pre_match_stats": {},
+            "initialized_at": datetime.now(timezone.utc)
+        }
+
+        result = await match_collection.insert_one(match_doc)
+        logging.info(f"Создана начальная запись матча для сервера {server['name']} (ID: {result.inserted_id})")
+        return result.inserted_id
+
+    except Exception as e:
+        logging.error(f"Ошибка при создании начальной записи матча для сервера {server['name']}: {e}")
+        return None
+
 # Функция для старта матча
 async def start_match(server):
     try:
         match_collection = await get_match_collection(server)
-        if not match_collection:
-            raise ValueError(f"Не удалось получить коллекцию matches для сервера {server['name']}")
 
+        # Проверяем, есть ли уже активный матч
+        existing_match = await match_collection.find_one({
+            "server_name": server["name"],
+            "active": True
+        })
+
+        if existing_match:
+            logging.info(f"Матч уже активен на сервере {server['name']} (ID: {existing_match['_id']})")
+            return existing_match["_id"]
+
+        # Создаем новую запись матча
         match_doc = {
             "server_name": server["name"],
             "active": True,
@@ -334,7 +379,6 @@ async def start_match(server):
             "pre_match_stats": {},
         }
 
-        # Пытаемся создать запись матча
         result = await match_collection.insert_one(match_doc)
 
         if not result.inserted_id:
@@ -348,13 +392,8 @@ async def start_match(server):
 
         return result.inserted_id
 
-    except ValueError as ve:
-        logging.error(f"Ошибка создания матча: {ve}")
-        raise
     except Exception as e:
-        logging.error(
-            f"Неожиданная ошибка при создании матча на сервере {server['name']}: {str(e)}",
-        )
+        logging.error(f"Ошибка при старте матча на сервере {server['name']}: {str(e)}")
         raise
 
 
@@ -927,6 +966,12 @@ async def main():
     logger = setup_logging()
     logger.info("Инициализация приложения")
 
+    for server in SERVERS:
+        try:
+            await create_initial_match_record(server)
+        except Exception as e:
+            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
+
     # Инициализация MongoDB
     for server in SERVERS:
         try:
@@ -987,8 +1032,9 @@ async def main():
         async def on_ready():
             logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
 
+        # Токен должен храниться в переменных окружения или конфиг-файле
         DISCORD_TOKEN = os.getenv(
-            'DISCORD_TOKEN') 
+            'DISCORD_TOKEN')  # Используйте переменные окружения
 
         if not DISCORD_TOKEN:
             raise ValueError("Discord token not found in environment variables")
