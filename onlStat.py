@@ -664,12 +664,18 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
             "tech_kills": get_tech_kills(player_data.get("weapons", {})) if player_data else 0,
             "timestamp": now,
             "eos": eos_id or player_data.get("eos") if player_data else None,
-            "last_updated": now
+            "last_updated": now,
+            "sever": server['name']
         }
 
         result = await stats_collection.update_one(
             {"_id": steam_id},
-            {"$set": stats},
+            {
+                "$set": stats,
+                "$setOnInsert": {
+                    "sever": server['name']
+                }
+            },
             upsert=True
         )
 
@@ -765,11 +771,16 @@ async def remove_disconnected_players(server):
     except Exception as e:
         logging.error(f"Ошибка при обработке отключившихся игроков: {str(e)}")
 
+
 async def calculate_final_stats(server: dict) -> None:
     """Вычисляет и сохраняет финальную статистику матча с учётом onl_stats"""
-    server_name = server["name"]
-
     try:
+        server_name = server["name"]
+
+        if not server_name:
+            logging.error("Не указано имя сервера в конфигурации")
+            return
+
         if not (client := mongo_clients.get(server_name)):
             logging.error(f"[{server_name}] MongoDB клиент недоступен")
             return
@@ -779,7 +790,18 @@ async def calculate_final_stats(server: dict) -> None:
         players_col = db[server["collection_name"]]
         onl_stats_col = db[server["onl_stats_collection_name"]]
 
-        # Получаем активный матч
+        server_players = await onl_stats_col.find(
+            {"sever": server_name},
+            projection={"_id": 1}
+        ).to_list(length=None)
+
+        if not server_players:
+            logging.warning(f"[{server_name}] Нет игроков с начальной статистикой для этого сервера")
+            return
+
+        player_ids = [p["_id"] for p in server_players]
+
+
         match = await matches_col.find_one(
             {"server_name": server_name, "active": True},
             projection={"players": 1}
@@ -789,34 +811,34 @@ async def calculate_final_stats(server: dict) -> None:
             logging.warning(f"[{server_name}] Активный матч не найден")
             return
 
-        player_ids = [p["steam_id"] for p in match.get("players", [])]
-        if not player_ids:
-            logging.warning(f"[{server_name}] Нет игроков в матче")
-            return
 
-        # Получаем текущую статистику игроков и их onl_stats
         players = await players_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
         onl_stats = await onl_stats_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
 
-        # Преобразуем onl_stats в словарь для быстрого доступа
+
         onl_stats_dict = {stat["_id"]: stat for stat in onl_stats}
 
-        # Вычисляем разницу между текущей статистикой и onl_stats
+
         diffs = []
         for player in players:
             player_id = player["_id"]
             initial_stats = onl_stats_dict.get(player_id, {})
 
-            # Вычисляем разницу
-            diff = await compute_diff(player, initial_stats)
-            diffs.append(diff)
 
-            await send_discord_report(diffs, server)
+            if initial_stats.get("sever") == server_name:
+                diff = await compute_diff(player, initial_stats)
+                diffs.append(diff)
 
+        if not diffs:
+            logging.warning(f"[{server_name}] Нет данных для расчета разницы статистики")
+            return
+
+
+        await send_discord_report(diffs, server)
         await update_onl_stats(db, diffs, server)
         await remove_disconnected_players(server)
 
-        logging.info(f"[{server_name}] Статистика успешно обработана")
+        logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
     except PyMongoError as e:
         logging.error(f"[{server_name}] Ошибка MongoDB: {str(e)}")
@@ -852,7 +874,6 @@ async def compute_diff(player: dict, initial: dict) -> dict:
             "kills_diff": 0,
             "revives_diff": 0,
             "tech_kills_diff": 0,
-            "total_score": 0
         }
 
 
@@ -864,34 +885,67 @@ async def send_discord_report(diffs, server):
             logging.error(f"[{server['name']}] Discord канал недоступен")
             return
 
+        # Основное сообщение
         await channel.send(f"📊 **Отчёт по изменению статистики на сервере {server['name']}**")
 
-        # Сортируем игроков по общему счёту
-        sorted_diffs = sorted(diffs, key=lambda x: x["total_score"], reverse=True)
+        # Фильтруем игроков с положительными изменениями
+        valid_diffs = [p for p in diffs if p["kills_diff"] > 0 or p["revives_diff"] > 0 or p["tech_kills_diff"] > 0]
 
-        # Создаём основной эмбед с топ-5 игроками
-        main_embed = discord.Embed(
-            title="🏆 Топ-5 игроков по изменениям статистики",
-            color=0x7289DA,
-            description="Изменения с момента последнего обновления"
-        )
+        if not valid_diffs:
+            await channel.send("Нет значимых изменений статистики.")
+            return
 
-        for idx, player in enumerate(sorted_diffs[:5], 1):
-            if player["total_score"] <= 0:
-                continue
-
-            main_embed.add_field(
-                name=f"{idx}. {player['name']}",
-                value=(
-                    f"🔫 Убийства: `+{player['kills_diff']}`\n"
-                    f"💉 Воскрешения: `+{player['revives_diff']}`\n"
-                    f"🛠️ Техника: `+{player['tech_kills_diff']}`"
-                ),
-                inline=False
+        # Топ-3 по убийствам
+        if any(p["kills_diff"] > 0 for p in valid_diffs):
+            kills_sorted = sorted(valid_diffs, key=lambda x: x["kills_diff"], reverse=True)[:3]
+            kills_embed = discord.Embed(
+                title="🔫 Топ-3 по убийствам",
+                color=0xFF0000  # Красный
             )
+            for idx, player in enumerate(kills_sorted, 1):
+                kills_embed.add_field(
+                    name=f"{idx}. {player['name']}",
+                    value=f"Убийства: `+{player['kills_diff']}`",
+                    inline=False
+                )
+            await channel.send(embed=kills_embed)
 
-        main_embed.set_footer(text=f"Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-        await channel.send(embed=main_embed)
+        # Топ-3 по воскрешениям
+        if any(p["revives_diff"] > 0 for p in valid_diffs):
+            revives_sorted = sorted(valid_diffs, key=lambda x: x["revives_diff"], reverse=True)[:3]
+            revives_embed = discord.Embed(
+                title="💉 Топ-3 по воскрешениям",
+                color=0x00FF00  # Зеленый
+            )
+            for idx, player in enumerate(revives_sorted, 1):
+                revives_embed.add_field(
+                    name=f"{idx}. {player['name']}",
+                    value=f"Воскрешения: `+{player['revives_diff']}`",
+                    inline=False
+                )
+            await channel.send(embed=revives_embed)
+
+        # Топ-3 по технике
+        if any(p["tech_kills_diff"] > 0 for p in valid_diffs):
+            tech_sorted = sorted(valid_diffs, key=lambda x: x["tech_kills_diff"], reverse=True)[:3]
+            tech_embed = discord.Embed(
+                title="🛠️ Топ-3 по технике",
+                color=0x0000FF  # Синий
+            )
+            for idx, player in enumerate(tech_sorted, 1):
+                tech_embed.add_field(
+                    name=f"{idx}. {player['name']}",
+                    value=f"Техника: `+{player['tech_kills_diff']}`",
+                    inline=False
+                )
+            await channel.send(embed=tech_embed)
+
+        # Общее время обновления
+        footer_embed = discord.Embed(
+            description=f"Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
+            color=0x7289DA
+        )
+        await channel.send(embed=footer_embed)
 
     except discord.errors.Forbidden:
         logging.error(f"[{server['name']}] Ошибка доступа к каналу Discord")
