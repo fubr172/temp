@@ -2,6 +2,7 @@ import asyncio
 import aiofiles
 import motor
 import pymongo
+import threading 
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from motor.core import AgnosticCollection
@@ -504,30 +505,26 @@ class SquadLogHandler(FileSystemEventHandler):
     async def _process_log_update(self):
         try:
             await asyncio.sleep(0.2)  # Дебаунс
-            await self._process_new_lines()
-        except Exception as e:
-            logging.error(f"Ошибка обработки лога: {e}")
-
-    async def _process_new_lines(self):
-        try:
-            if not os.path.exists(self.log_path):
-                logging.warning(f"Лог-файл {self.log_path} не найден")
-                return
-
-            current_size = os.path.getsize(self.log_path)
+            
+            # Синхронное получение размера файла
+            def get_file_size():
+                return os.path.getsize(self.log_path) if os.path.exists(self.log_path) else 0
+            
+            current_size = await self.loop.run_in_executor(None, get_file_size)
+            
             if current_size < self._position:
                 self._position = 0
 
             async with aiofiles.open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
                 await f.seek(self._position)
                 lines = await f.readlines()
-                self._position = f.tell()
+                self._position = await f.tell()
 
                 for line in lines:
                     if line.strip():
                         await process_log_line(line.strip(), self.server)
         except Exception as e:
-            logging.error(f"Ошибка чтения лог-файла: {e}")
+            logging.error(f"Ошибка обработки лога: {e}")
 
     def shutdown(self):
         self._active = False
@@ -868,7 +865,7 @@ async def main():
             observer_thread.daemon = True
             observer_thread.start()
             
-            observers.append((observer, observer_thread))
+            observers.append((observer, observer_thread, handler))
             logging.info(f"Мониторинг логов запущен: {server['name']}")
         except Exception as e:
             logging.error(f"Ошибка наблюдателя ({server['name']}): {e}")
@@ -880,14 +877,14 @@ async def main():
     # Запуск бота Discord
     try:
         logging.info("Запуск Discord бота...")
-        await bot.start('YOUR_BOT_TOKEN_HERE')
+        await bot.start('YOUR_BOT_TOKEN_HERE')  # Замените на реальный токен
     except discord.LoginFailure:
         logging.critical("Неверный токен Discord бота")
     except Exception as e:
         logging.critical(f"Ошибка Discord бота: {e}")
     finally:
         # Корректное завершение
-        for observer, thread in observers:
+        for observer, thread, handler in observers:
             handler.shutdown()
             observer.stop()
             thread.join()
