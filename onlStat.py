@@ -702,10 +702,37 @@ async def remove_disconnected_players(server):
         if not disconnected_eos:
             return
 
+
         players_stats = await db[server["onl_stats_collection_name"]].find(
-            {"eos": {"$in": disconnected_eos}},
-            {"_id": 1}  # Получаем только steam_id (_id)
+            {"$or": [
+                {"eos": {"$in": disconnected_eos}},
+                {"eos": None}
+            ]},
+            {"_id": 1, "eos": 1}
         ).to_list(length=None)
+
+
+        eos_to_remove = []
+        steam_ids_with_null_eos = []
+
+        for player in players_stats:
+            if player.get("eos") in disconnected_eos:
+                eos_to_remove.append(player["eos"])
+            elif player.get("eos") is None:
+                steam_ids_with_null_eos.append(str(player["_id"]))
+
+
+        if steam_ids_with_null_eos:
+            users_with_eos = await db[server["collection_name"]].find(
+                {"_id": {"$in": steam_ids_with_null_eos}},
+                {"_id": 1, "eosid": 1}
+            ).to_list(length=None)
+
+
+            for user in users_with_eos:
+                if "eosid" in user and user["eosid"]:
+                    eos_to_remove.append(user["eosid"])
+                    disconnected_eos.append(user["eosid"])
 
         steam_ids_to_remove = [str(player["_id"]) for player in players_stats]
 
@@ -723,16 +750,20 @@ async def remove_disconnected_players(server):
         )
 
         if update_result.modified_count > 0:
+
             delete_result = await db[server["onl_stats_collection_name"]].delete_many(
-                {"eos": {"$in": disconnected_eos}}
+                {"$or": [
+                    {"eos": {"$in": eos_to_remove}},
+                    {"_id": {"$in": steam_ids_with_null_eos}}
+                ]}
             )
-            logging.info(f"Удалено {delete_result.deleted_count} записей статистики по EOS: {disconnected_eos}")
+            logging.info(
+                f"Удалено {delete_result.deleted_count} записей статистики. EOS: {eos_to_remove}, SteamID: {steam_ids_with_null_eos}")
         else:
             logging.warning("Не удалось обновить матч, статистика не будет удалена")
 
     except Exception as e:
         logging.error(f"Ошибка при обработке отключившихся игроков: {str(e)}")
-
 
 async def calculate_final_stats(server: dict) -> None:
     """Вычисляет и сохраняет финальную статистику матча с учётом onl_stats"""
