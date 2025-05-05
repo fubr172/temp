@@ -498,7 +498,7 @@ class SquadLogHandler(FileSystemEventHandler):
 
     def on_modified(self, event):
         if event.src_path == self.log_path and self._active:
-            asyncio.run_coroutine_threadsafe(self._process_log_update(), bot.loop)
+            asyncio.create_task(self._process_log_update())
 
     async def _process_log_update(self):
         try:
@@ -506,6 +506,37 @@ class SquadLogHandler(FileSystemEventHandler):
             await self._process_new_lines()
         except Exception as e:
             logging.error(f"Ошибка обработки лога: {e}")
+
+    async def _process_new_lines(self):
+        try:
+            if not os.path.exists(self.log_path):
+                logging.warning(f"Лог-файл {self.log_path} не найден")
+                return
+
+            # Получаем текущий размер файла синхронно
+            current_size = os.path.getsize(self.log_path)
+            if current_size < self._position:
+                # Файл был перезаписан (ротирован)
+                self._position = 0
+
+            async with aiofiles.open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                await f.seek(self._position)
+                lines = await f.readlines()
+                self._position = f.tell()
+
+                for line in lines:
+                    line = line.strip()
+                    if line:
+                        try:
+                            await process_log_line(line, self.server)
+                        except Exception as e:
+                            logging.error(f"Ошибка обработки строки лога: {e}")
+
+        except Exception as e:
+            logging.error(f"Ошибка чтения лог-файла {self.log_path}: {e}")
+
+    def shutdown(self):
+        self._active = False
 
     async def _process_new_lines(self):
         try:
@@ -836,10 +867,7 @@ async def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler('squad_stats.log')
-        ]
+        handlers=[logging.StreamHandler()]
     )
 
     # Инициализация MongoDB
@@ -850,7 +878,7 @@ async def main():
             mongo_clients[server["name"]] = client
             logging.info(f"MongoDB подключен: {server['name']}")
         except Exception as e:
-            logging.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
+            logging.error(f"Ошибка MongoDB ({server['name']}): {e}")
             continue
 
     # Запуск наблюдателей логов
@@ -860,27 +888,26 @@ async def main():
             handler = SquadLogHandler(server["logFilePath"], server)
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
-            
-            # Запуск в отдельном потоке
-            observer_thread = threading.Thread(target=observer.start)
-            observer_thread.daemon = True
-            observer_thread.start()
-            
-            observers.append((observer, handler))
+            observer.start()
+            observers.append(observer)
             logging.info(f"Мониторинг логов запущен: {server['name']}")
         except Exception as e:
-            logging.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
+            logging.error(f"Ошибка наблюдателя ({server['name']}): {e}")
 
-    # Запуск бота Discord
+    # Запуск бота Discord с правильными интентами
+    intents = discord.Intents.default()
+    intents.message_content = True  # Если нужно читать содержимое сообщений
+
     try:
         logging.info("Запуск Discord бота...")
-        await bot.start('YOUR_VALID_TOKEN_HERE')
+        await bot.start('YOUR_BOT_TOKEN_HERE')  # Замените на реальный токен
+    except discord.LoginFailure:
+        logging.critical("Неверный токен Discord бота")
     except Exception as e:
-        logging.critical(f"Ошибка Discord бота: {str(e)}")
+        logging.critical(f"Ошибка Discord бота: {e}")
     finally:
         # Корректное завершение
-        for observer, handler in observers:
-            handler.stop()
+        for observer in observers:
             observer.stop()
             observer.join()
         
@@ -892,4 +919,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
-        logging.critical(f"Критическая ошибка: {str(e)}")
