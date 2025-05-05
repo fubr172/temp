@@ -400,6 +400,7 @@ async def start_match(server):
         }
 
         result = await match_collection.insert_one(match_doc)
+        await remove_disconnected_players(server)
 
         if not result.inserted_id:
             raise ValueError("Не удалось создать запись матча, inserted_id не получен")
@@ -411,6 +412,7 @@ async def start_match(server):
         )
 
         return result.inserted_id
+
 
 
     except Exception as e:
@@ -665,7 +667,7 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
             "timestamp": now,
             "eos": eos_id or player_data.get("eos") if player_data else None,
             "last_updated": now,
-            "sever": server['name']
+            "server": server['name']
         }
 
         result = await stats_collection.update_one(
@@ -673,7 +675,7 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
             {
                 "$set": stats,
                 "$setOnInsert": {
-                    "sever": server['name']
+                    "created_at": now
                 }
             },
             upsert=True
@@ -708,7 +710,6 @@ async def remove_disconnected_players(server):
         if not disconnected_eos:
             return
 
-
         players_stats = await db[server["onl_stats_collection_name"]].find(
             {"$or": [
                 {"eos": {"$in": disconnected_eos}},
@@ -716,7 +717,6 @@ async def remove_disconnected_players(server):
             ]},
             {"_id": 1, "eos": 1}
         ).to_list(length=None)
-
 
         eos_to_remove = []
         steam_ids_with_null_eos = []
@@ -727,13 +727,11 @@ async def remove_disconnected_players(server):
             elif player.get("eos") is None:
                 steam_ids_with_null_eos.append(str(player["_id"]))
 
-
         if steam_ids_with_null_eos:
             users_with_eos = await db[server["collection_name"]].find(
                 {"_id": {"$in": steam_ids_with_null_eos}},
                 {"_id": 1, "eosid": 1}
             ).to_list(length=None)
-
 
             for user in users_with_eos:
                 if "eosid" in user and user["eosid"]:
@@ -791,7 +789,7 @@ async def calculate_final_stats(server: dict) -> None:
         onl_stats_col = db[server["onl_stats_collection_name"]]
 
         server_players = await onl_stats_col.find(
-            {"sever": server_name},
+            {"server": server_name},
             projection={"_id": 1}
         ).to_list(length=None)
 
@@ -800,7 +798,6 @@ async def calculate_final_stats(server: dict) -> None:
             return
 
         player_ids = [p["_id"] for p in server_players]
-
 
         match = await matches_col.find_one(
             {"server_name": server_name, "active": True},
@@ -811,21 +808,17 @@ async def calculate_final_stats(server: dict) -> None:
             logging.warning(f"[{server_name}] Активный матч не найден")
             return
 
-
         players = await players_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
         onl_stats = await onl_stats_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
 
-
         onl_stats_dict = {stat["_id"]: stat for stat in onl_stats}
-
 
         diffs = []
         for player in players:
             player_id = player["_id"]
             initial_stats = onl_stats_dict.get(player_id, {})
 
-
-            if initial_stats.get("sever") == server_name:
+            if initial_stats.get("server") == server_name:
                 diff = await compute_diff(player, initial_stats)
                 diffs.append(diff)
 
@@ -833,10 +826,8 @@ async def calculate_final_stats(server: dict) -> None:
             logging.warning(f"[{server_name}] Нет данных для расчета разницы статистики")
             return
 
-
         await send_discord_report(diffs, server)
         await update_onl_stats(db, diffs, server)
-        await remove_disconnected_players(server)
 
         logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
@@ -1041,9 +1032,38 @@ def setup_logging():
             print(f"Не удалось создать директорию логов: {e}", file=sys.stderr)
             raise
 
-        log_format = "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
+        COLORS = {
+            'DEBUG': '\033[94m',  # Синий
+            'INFO': '\033[92m',  # Зелёный
+            'WARNING': '\033[93m',  # Жёлтый
+            'ERROR': '\033[91m',  # Красный
+            'CRITICAL': '\033[41m',  # Красный фон
+            'RESET': '\033[0m'  # Сброс цвета
+        }
+
+        class ColorFormatter(logging.Formatter):
+            def format(self, record):
+                level_color = COLORS.get(record.levelname, COLORS['RESET'])
+                message = super().format(record)
+                return (
+                    f"{level_color}"
+                    f"{message}"
+                    f"{COLORS['RESET']}"
+                )
+
+        log_format = (
+            "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
+        )
         date_format = "%Y-%m-%d %H:%M:%S"
-        formatter = logging.Formatter(log_format, datefmt=date_format)
+
+        # Форматтер для файла (без цветов)
+        file_formatter = logging.Formatter(log_format, datefmt=date_format)
+
+        # Форматтер для консоли (с цветами)
+        console_formatter = ColorFormatter(
+            f"{COLORS['RESET']}{log_format}",
+            datefmt=date_format
+        )
 
         logger = logging.getLogger()
         logger.setLevel(logging.DEBUG)
@@ -1058,13 +1078,13 @@ def setup_logging():
         logging.getLogger('discord.gateway').setLevel(logging.WARNING)
         logging.getLogger('discord.client').setLevel(logging.INFO)
 
-        # 1. Консольный вывод
+        # 1. Консольный вывод с цветами
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(console_formatter)  # Используем цветной форматтер
         logger.addHandler(console_handler)
 
-        # 2. Файловый вывод с обработкой ошибок
+        # 2. Файловый вывод (без цветов)
         log_file = log_dir / "application.log"
         try:
             file_handler = RotatingFileHandler(
@@ -1074,8 +1094,9 @@ def setup_logging():
                 encoding='utf-8'
             )
             file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(formatter)
+            file_handler.setFormatter(file_formatter)  # Обычный форматтер
             logger.addHandler(file_handler)
+
         except PermissionError:
             logger.error(f"Нет прав на запись в файл логов: {log_file}")
         except Exception as e:
@@ -1120,50 +1141,29 @@ async def verify_log_file(log_path):
         return False
 
 
-import os
-import sys
-import asyncio
-import threading
-import logging
-from dotenv import load_dotenv  # Добавьте этот импорт
-
-# Загрузка переменных окружения из .env файла
-load_dotenv()
-
-# ... (остальные импорты остаются без изменений)
-
-# Глобальная инициализация бота
-intents = discord.Intents.default()
-intents.messages = True
-intents.guilds = True
-intents.members = True
-intents.message_content = True  # Добавлено для доступа к содержимому сообщений
-
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-@bot.event
-async def on_ready():
-    """Обработчик события запуска бота"""
-    logging.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
-    await main()  # Запуск основной логики после подключения бота
-
 async def main():
-    """Основная асинхронная логика приложения"""
+    # Инициализация логирования
     logger = setup_logging()
     logger.info("Инициализация приложения")
 
     # Инициализация MongoDB
     for server in SERVERS:
         try:
+            logger.debug(f"Подключение к MongoDB: {server['name']}")
             client = AsyncIOMotorClient(
                 server["mongo_uri"],
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
                 socketTimeoutMS=30000
             )
+
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
-            logger.info(f"MongoDB подключен: {server['name']}")
+
+            db = client[server["db_name"]]
+            collections = await db.list_collection_names()
+            logger.info(f"MongoDB подключен: {server['name']}. Коллекции: {collections}")
+
         except Exception as e:
             logger.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
             continue
@@ -1175,6 +1175,8 @@ async def main():
             if not await verify_log_file(server["logFilePath"]):
                 continue
 
+            logger.debug(f"Запуск наблюдателя для: {server['name']}")
+
             handler = SquadLogHandler(server["logFilePath"], server, asyncio.get_running_loop())
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
@@ -1185,51 +1187,69 @@ async def main():
                 daemon=True
             )
             observer_thread.start()
+
             observers.append((observer, observer_thread, handler))
             logger.info(f"Мониторинг логов запущен: {server['name']}")
 
         except Exception as e:
             logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
 
-    # Инициализация записей матчей
     for server in SERVERS:
         try:
             await create_initial_match_record(server)
         except Exception as e:
-            logger.error(f"Ошибка инициализации матча: {e}")
+            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
 
-async def shutdown(observers):
-    """Корректное завершение работы"""
-    logging.info("Завершение работы приложения")
-    
-    # Остановка наблюдателей
-    for observer, thread, handler in observers:
-        try:
-            handler.shutdown()
-            observer.stop()
-            thread.join(timeout=5)
-            logging.info(f"Наблюдатель остановлен: {handler.server['name']}")
-        except Exception as e:
-            logging.error(f"Ошибка остановки наблюдателя: {str(e)}")
-    
-    # Закрытие подключений MongoDB
-    for name, client in mongo_clients.items():
-        try:
-            client.close()
-            await asyncio.sleep(0.1)
-            logging.info(f"MongoDB отключен: {name}")
-        except Exception as e:
-            logging.error(f"Ошибка закрытия MongoDB: {str(e)}")
+    # Настройка Discord бота
+    try:
+        logger.debug("Инициализация Discord бота")
+        intents = discord.Intents.default()
+        intents.message_content = True
+
+        bot = commands.Bot(command_prefix='!', intents=intents)
+
+        @bot.event
+        async def on_ready():
+            logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
+
+            # Токен должен храниться в переменных окружения или конфиг-файле
+
+        DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # Используйте переменные окружения
+
+        if not DISCORD_TOKEN:
+            raise ValueError("Discord token not found in environment variables")
+
+        logger.info("Запуск Discord бота")
+        await bot.start(DISCORD_TOKEN)
+
+    finally:
+        logger.info("Завершение работы приложения")
+
+        # Остановка наблюдателей
+        for observer, thread, handler in observers:
+            try:
+                handler.shutdown()
+                observer.stop()
+                thread.join(timeout=5)
+                logger.info(f"Наблюдатель остановлен: {handler.server['name']}")
+            except Exception as e:
+                logger.error(f"Ошибка остановки наблюдателя: {str(e)}")
+
+        # Закрытие подключений MongoDB
+        for name, client in mongo_clients.items():
+            try:
+                client.close()
+                await asyncio.sleep(0.1)
+                logger.info(f"MongoDB отключен: {name}")
+            except Exception as e:
+                logger.error(f"Ошибка закрытия MongoDB: {str(e)}")
+
+        logger.info("Приложение завершено")
+
 
 if __name__ == "__main__":
     try:
-        # Используйте токен из переменных окружения
-        DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") 
-        if not DISCORD_TOKEN:
-            raise ValueError("Токен Discord не найден!")
-            
-        bot.run(DISCORD_TOKEN)  # Единственная точка входа для бота
-
+        asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
