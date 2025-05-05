@@ -459,10 +459,12 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
         if result.modified_count == 1:
             player_info = f"{player_name or 'Безымянный'} (SteamID: {steam_id})"
             logging.info(f"Игрок {player_info} добавлен на сервер {server['name']}")
+            await save_initial_stats(server, steam_id, eos_id)
             return True
 
         logging.debug(f"Игрок {steam_id} уже присутствует в матче на сервере {server['name']}")
         return False
+
 
     except Exception as e:
         logging.error(f"Ошибка при добавлении игрока {steam_id}: {str(e)}")
@@ -809,7 +811,6 @@ async def compute_diff(player: dict, initial: dict) -> dict:
             "kills_diff": max(kills_diff, 0),
             "revives_diff": max(revives_diff, 0),
             "tech_kills_diff": max(tech_diff, 0),
-            "total_score": max(kills_diff, 0) + max(revives_diff, 0) + max(tech_diff, 0)
         }
 
     except Exception as e:
