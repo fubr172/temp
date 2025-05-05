@@ -1120,29 +1120,50 @@ async def verify_log_file(log_path):
         return False
 
 
+import os
+import sys
+import asyncio
+import threading
+import logging
+from dotenv import load_dotenv  # Добавьте этот импорт
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
+
+# ... (остальные импорты остаются без изменений)
+
+# Глобальная инициализация бота
+intents = discord.Intents.default()
+intents.messages = True
+intents.guilds = True
+intents.members = True
+intents.message_content = True  # Добавлено для доступа к содержимому сообщений
+
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    """Обработчик события запуска бота"""
+    logging.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
+    await main()  # Запуск основной логики после подключения бота
+
 async def main():
-    # Инициализация логирования
+    """Основная асинхронная логика приложения"""
     logger = setup_logging()
     logger.info("Инициализация приложения")
 
     # Инициализация MongoDB
     for server in SERVERS:
         try:
-            logger.debug(f"Подключение к MongoDB: {server['name']}")
             client = AsyncIOMotorClient(
                 server["mongo_uri"],
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
                 socketTimeoutMS=30000
             )
-
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
-
-            db = client[server["db_name"]]
-            collections = await db.list_collection_names()
-            logger.info(f"MongoDB подключен: {server['name']}. Коллекции: {collections}")
-
+            logger.info(f"MongoDB подключен: {server['name']}")
         except Exception as e:
             logger.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
             continue
@@ -1154,8 +1175,6 @@ async def main():
             if not await verify_log_file(server["logFilePath"]):
                 continue
 
-            logger.debug(f"Запуск наблюдателя для: {server['name']}")
-
             handler = SquadLogHandler(server["logFilePath"], server, asyncio.get_running_loop())
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
@@ -1166,70 +1185,51 @@ async def main():
                 daemon=True
             )
             observer_thread.start()
-
             observers.append((observer, observer_thread, handler))
             logger.info(f"Мониторинг логов запущен: {server['name']}")
 
         except Exception as e:
             logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
 
+    # Инициализация записей матчей
     for server in SERVERS:
         try:
             await create_initial_match_record(server)
         except Exception as e:
-            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
+            logger.error(f"Ошибка инициализации матча: {e}")
 
-    # Настройка Discord бота
-    try:
-        logger.debug("Инициализация Discord бота")
-        intents = discord.Intents.default()
-        intents.message_content = True
-
-        bot = commands.Bot(command_prefix='!', intents=intents)
-
-        @bot.event
-        async def on_ready():
-            logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
-
-            # Токен должен храниться в переменных окружения или конфиг-файле
-
-        DISCORD_TOKEN = os.getenv(
-            'DISCORD_TOKEN')  # Используйте переменные окружения
-
-        if not DISCORD_TOKEN:
-            raise ValueError("Discord token not found in environment variables")
-
-        logger.info("Запуск Discord бота")
-        await bot.start(DISCORD_TOKEN)
-
-    finally:
-        logger.info("Завершение работы приложения")
-
-        # Остановка наблюдателей
-        for observer, thread, handler in observers:
-            try:
-                handler.shutdown()
-                observer.stop()
-                thread.join(timeout=5)
-                logger.info(f"Наблюдатель остановлен: {handler.server['name']}")
-            except Exception as e:
-                logger.error(f"Ошибка остановки наблюдателя: {str(e)}")
-
-        # Закрытие подключений MongoDB
-        for name, client in mongo_clients.items():
-            try:
-                client.close()
-                await asyncio.sleep(0.1)
-                logger.info(f"MongoDB отключен: {name}")
-            except Exception as e:
-                logger.error(f"Ошибка закрытия MongoDB: {str(e)}")
-
-        logger.info("Приложение завершено")
-
+async def shutdown(observers):
+    """Корректное завершение работы"""
+    logging.info("Завершение работы приложения")
+    
+    # Остановка наблюдателей
+    for observer, thread, handler in observers:
+        try:
+            handler.shutdown()
+            observer.stop()
+            thread.join(timeout=5)
+            logging.info(f"Наблюдатель остановлен: {handler.server['name']}")
+        except Exception as e:
+            logging.error(f"Ошибка остановки наблюдателя: {str(e)}")
+    
+    # Закрытие подключений MongoDB
+    for name, client in mongo_clients.items():
+        try:
+            client.close()
+            await asyncio.sleep(0.1)
+            logging.info(f"MongoDB отключен: {name}")
+        except Exception as e:
+            logging.error(f"Ошибка закрытия MongoDB: {str(e)}")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # Используйте токен из переменных окружения
+        DISCORD_TOKEN = os.getenv("DISCORD_TOKEN") 
+        if not DISCORD_TOKEN:
+            raise ValueError("Токен Discord не найден!")
+            
+        bot.run(DISCORD_TOKEN)  # Единственная точка входа для бота
+
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
