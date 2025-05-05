@@ -7,6 +7,7 @@ import logging
 import re
 import os
 import discord
+import sys
 
 from logging.handlers import RotatingFileHandler
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -924,17 +925,15 @@ async def main():
                 socketTimeoutMS=30000
             )
             
-            # Проверка подключения
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
             
-            # Проверка коллекций
             db = client[server["db_name"]]
             collections = await db.list_collection_names()
             logger.info(f"MongoDB подключен: {server['name']}. Коллекции: {collections}")
             
         except Exception as e:
-            logger.error(f"Ошибка MongoDB ({server['name']}):", exc_info=True)
+            logger.error(f"Ошибка MongoDB ({server['name']}): {str(e)}", exc_info=True)
             continue
 
     # Запуск наблюдателей логов
@@ -961,7 +960,7 @@ async def main():
             logger.info(f"Мониторинг логов запущен: {server['name']}")
             
         except Exception as e:
-            logger.error(f"Ошибка наблюдателя ({server['name']}):", exc_info=True)
+            logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}", exc_info=True)
 
     # Настройка Discord бота
     try:
@@ -969,7 +968,7 @@ async def main():
         intents = discord.Intents.default()
         intents.message_content = True
         
-        bot = commands.Bot(intents=intents)
+        bot = commands.Bot(command_prefix='!', intents=intents)
         
         @bot.event
         async def on_ready():
@@ -979,15 +978,21 @@ async def main():
         async def on_error(event, *args, **kwargs):
             logger.error(f"Ошибка в событии {event}:", exc_info=True)
         
+        # Токен должен храниться в переменных окружения или конфиг-файле
+        DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')  # Используйте переменные окружения
+        
+        if not DISCORD_TOKEN:
+            raise ValueError("Discord token not found in environment variables")
+            
         logger.info("Запуск Discord бота")
-        await bot.start(os.getenv('DISCORD_TOKEN'))  # Токен из переменных окружения
+        await bot.start(DISCORD_TOKEN)
         
     except discord.LoginFailure:
         logger.critical("Ошибка аутентификации Discord", exc_info=True)
     except discord.DiscordException as e:
         logger.critical(f"Ошибка Discord API: {e}", exc_info=True)
     except Exception as e:
-        logger.critical("Фатальная ошибка Discord бота:", exc_info=True)
+        logger.critical(f"Фатальная ошибка Discord бота: {str(e)}", exc_info=True)
     finally:
         logger.info("Завершение работы приложения")
         
@@ -999,7 +1004,7 @@ async def main():
                 thread.join(timeout=5)
                 logger.info(f"Наблюдатель остановлен: {handler.server['name']}")
             except Exception as e:
-                logger.error("Ошибка остановки наблюдателя:", exc_info=True)
+                logger.error(f"Ошибка остановки наблюдателя: {str(e)}", exc_info=True)
         
         # Закрытие подключений MongoDB
         for name, client in mongo_clients.items():
@@ -1008,7 +1013,7 @@ async def main():
                 await asyncio.sleep(0.1)
                 logger.info(f"MongoDB отключен: {name}")
             except Exception as e:
-                logger.error("Ошибка закрытия MongoDB:", exc_info=True)
+                logger.error(f"Ошибка закрытия MongoDB: {str(e)}", exc_info=True)
         
         logger.info("Приложение завершено")
 
@@ -1018,5 +1023,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
-        logging.critical("Критическая ошибка:", exc_info=True)
+        logging.critical(f"Критическая ошибка: {str(e)}", exc_info=True)
         sys.exit(1)
