@@ -7,6 +7,7 @@ import re
 import os
 import discord
 import sys
+import colorama
 
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -380,9 +381,8 @@ async def start_match(server):
                 {"_id": inactive_match["_id"]},
                 {"$set": {
                     "active": True,
-                    "start_time": new_start_time,
-                    "players": [],
-                    "disconnected_players": [],
+                    "start_time": new_start_time
+
                 }}
             )
             logging.info(
@@ -400,7 +400,6 @@ async def start_match(server):
         }
 
         result = await match_collection.insert_one(match_doc)
-        await remove_disconnected_players(server)
 
         if not result.inserted_id:
             raise ValueError("Не удалось создать запись матча, inserted_id не получен")
@@ -481,8 +480,7 @@ async def player_disconnect(server, eos_id):
     try:
         match_collection = await get_match_collection(server)
         active_match = await match_collection.find_one({
-            "server_name": server["name"],
-            "active": True
+            "server_name": server["name"]
         })
 
         if not active_match:
@@ -508,6 +506,7 @@ async def player_disconnect(server, eos_id):
 
 
 async def end_match(server):
+    print('Функция end_match работает')
     try:
         match_collection = await get_match_collection(server)
         match = await match_collection.find_one({"server_name": server["name"], "active": True})
@@ -550,6 +549,7 @@ intents = discord.Intents.default()
 intents.messages = True
 intents.guilds = True
 intents.members = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -694,20 +694,30 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
 
 
 async def remove_disconnected_players(server):
+    logging.info('Начинаем удаление отключившихся игроков')
     server_name = server["name"]
-    client = mongo_clients[server_name]
+    client = mongo_clients.get(server_name)
+    if not client:
+        logging.error(f"MongoDB клиент не найден для сервера {server_name}")
+        return
     db = client[server["db_name"]]
 
     try:
+        logging.info(f"Ищем матч с active=False для сервера {server_name}")
         match = await db[server["matches_collection_name"]].find_one(
-            {"server_name": server_name, "active": True}
+            {"server_name": server_name, "active": False}
         )
+        logging.info(f"Результат поиска матча: {match is not None}")
+
         if not match:
             logging.warning(f"Активный матч не найден для сервера {server_name}")
             return
 
         disconnected_eos = match.get("disconnected_players", [])
+        logging.info(f"Список отключённых игроков (EOS): {disconnected_eos}")
+
         if not disconnected_eos:
+            logging.info("Список отключённых игроков пуст, ничего удалять не нужно")
             return
 
         players_stats = await db[server["onl_stats_collection_name"]].find(
@@ -717,28 +727,37 @@ async def remove_disconnected_players(server):
             ]},
             {"_id": 1, "eos": 1}
         ).to_list(length=None)
+        logging.info(f"Найдено статистики игроков для удаления: {len(players_stats)}")
 
         eos_to_remove = []
         steam_ids_with_null_eos = []
 
         for player in players_stats:
-            if player.get("eos") in disconnected_eos:
-                eos_to_remove.append(player["eos"])
-            elif player.get("eos") is None:
+            eos = player.get("eos")
+            if eos in disconnected_eos:
+                eos_to_remove.append(eos)
+            elif eos is None:
                 steam_ids_with_null_eos.append(str(player["_id"]))
+
+        logging.info(f"EOS для удаления: {eos_to_remove}")
+        logging.info(f"SteamID с null EOS для удаления: {steam_ids_with_null_eos}")
 
         if steam_ids_with_null_eos:
             users_with_eos = await db[server["collection_name"]].find(
                 {"_id": {"$in": steam_ids_with_null_eos}},
                 {"_id": 1, "eosid": 1}
             ).to_list(length=None)
+            logging.info(f"Найдено пользователей с EOS для SteamID с null EOS: {len(users_with_eos)}")
 
             for user in users_with_eos:
-                if "eosid" in user and user["eosid"]:
-                    eos_to_remove.append(user["eosid"])
-                    disconnected_eos.append(user["eosid"])
+                eosid = user.get("eosid")
+                if eosid:
+                    eos_to_remove.append(eosid)
+                    disconnected_eos.append(eosid)
+            logging.info(f"Обновлённый список EOS для удаления: {eos_to_remove}")
 
         steam_ids_to_remove = [str(player["_id"]) for player in players_stats]
+        logging.info(f"SteamID для удаления из матча: {steam_ids_to_remove}")
 
         update_operations = {
             "$set": {"disconnected_players": []}
@@ -746,15 +765,15 @@ async def remove_disconnected_players(server):
 
         if steam_ids_to_remove:
             update_operations["$pull"] = {"players": {"$in": steam_ids_to_remove}}
-            logging.info(f"Удаляемые steam_id из матча: {steam_ids_to_remove}")
+            logging.info(f"Подготавливаем удаление SteamID из матча: {steam_ids_to_remove}")
 
         update_result = await db[server["matches_collection_name"]].update_one(
             {"_id": match["_id"]},
             update_operations
         )
+        logging.info(f"Результат обновления матча: modified_count={update_result.modified_count}")
 
         if update_result.modified_count > 0:
-
             delete_result = await db[server["onl_stats_collection_name"]].delete_many(
                 {"$or": [
                     {"eos": {"$in": eos_to_remove}},
@@ -774,6 +793,7 @@ async def calculate_final_stats(server: dict) -> None:
     """Вычисляет и сохраняет финальную статистику матча с учётом onl_stats"""
     try:
         server_name = server["name"]
+        logging.info(f'{server_name} расчет статы')
 
         if not server_name:
             logging.error("Не указано имя сервера в конфигурации")
@@ -800,7 +820,7 @@ async def calculate_final_stats(server: dict) -> None:
         player_ids = [p["_id"] for p in server_players]
 
         match = await matches_col.find_one(
-            {"server_name": server_name, "active": True},
+            {"server_name": server_name, "active": False},
             projection={"players": 1}
         )
 
@@ -818,6 +838,7 @@ async def calculate_final_stats(server: dict) -> None:
             player_id = player["_id"]
             initial_stats = onl_stats_dict.get(player_id, {})
 
+            logging.info(f'Измениние для игрока {player['_id']}')
             if initial_stats.get("server") == server_name:
                 diff = await compute_diff(player, initial_stats)
                 diffs.append(diff)
@@ -827,7 +848,9 @@ async def calculate_final_stats(server: dict) -> None:
             return
 
         await send_discord_report(diffs, server)
+        logging.info(f"Вызываем remove_disconnected_players")
         await update_onl_stats(db, diffs, server)
+        logging.info(f"remove_disconnected_players выполнена успешно")
 
         logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
@@ -871,11 +894,12 @@ async def compute_diff(player: dict, initial: dict) -> dict:
 async def send_discord_report(diffs, server):
     """Отправляет отчёт в Discord с разницей статистики"""
     try:
+        logging.info(f"{server['name']} Попытка отправки в диск")
         channel = bot.get_channel(server["discord_channel_id"])
         if not channel:
             logging.error(f"[{server['name']}] Discord канал недоступен")
             return
-
+        logging.error(f"{server["name"]} нашёл канал")
         # Основное сообщение
         await channel.send(f"📊 **Отчёт по изменению статистики на сервере {server['name']}**")
 
@@ -896,7 +920,7 @@ async def send_discord_report(diffs, server):
             for idx, player in enumerate(kills_sorted, 1):
                 kills_embed.add_field(
                     name=f"{idx}. {player['name']}",
-                    value=f"Убийства: `+{player['kills_diff']}`",
+                    value=f"Убийства: `{player['kills_diff']}`",
                     inline=False
                 )
             await channel.send(embed=kills_embed)
@@ -931,12 +955,6 @@ async def send_discord_report(diffs, server):
                 )
             await channel.send(embed=tech_embed)
 
-        # Общее время обновления
-        footer_embed = discord.Embed(
-            description=f"Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
-            color=0x7289DA
-        )
-        await channel.send(embed=footer_embed)
 
     except discord.errors.Forbidden:
         logging.error(f"[{server['name']}] Ошибка доступа к каналу Discord")
@@ -946,6 +964,7 @@ async def send_discord_report(diffs, server):
 
 async def update_onl_stats(db, players, server):
     """Обновляет статистику в коллекции onl_stats текущими значениями"""
+    logging.info(f"[{server['name']}] Начинается обновление статистики игроков")
     try:
         if not players:
             logging.info(f"[{server['name']}] Нет данных игроков для обновления")
@@ -957,6 +976,7 @@ async def update_onl_stats(db, players, server):
 
         for player in players:
             if not player.get("_id"):
+                logging.error(f"[{server['name']}] Игрок без _id пропущен")
                 continue
 
             # Подготавливаем данные для обновления
@@ -968,7 +988,7 @@ async def update_onl_stats(db, players, server):
                 "server": server["name"]
             }
 
-            # Добавляем имя игрока, если его нет в onl_stats
+            # Добавляем имя игрока, если оно есть
             if "name" in player:
                 update_data["name"] = player["name"]
 
@@ -981,9 +1001,17 @@ async def update_onl_stats(db, players, server):
             )
 
         if bulk_ops:
+            logging.info(f"[{server['name']}] Выполняется bulk_write с {len(bulk_ops)} операциями")
             result = await stats_collection.bulk_write(bulk_ops)
             logging.info(
-                f"[{server['name']}] Обновлено записей: {result.modified_count}, добавлено: {result.upserted_count}")
+                f"[{server['name']}] Обновлено записей: {result.modified_count}, добавлено: {result.upserted_count}"
+            )
+        else:
+            logging.info(f"[{server['name']}] Нет операций для записи в bulk_write")
+
+        logging.info(f"[{server['name']}] Вызываем remove_disconnected_players")
+        await remove_disconnected_players(server)
+        logging.info(f"[{server['name']}] remove_disconnected_players выполнена успешно")
 
     except pymongo.errors.BulkWriteError as e:
         logging.error(f"[{server['name']}] Ошибка пакетного обновления: {e.details}")
@@ -1022,93 +1050,76 @@ def get_tech_kills(weapons):
 
 
 def setup_logging():
-    """Настройка комплексного логирования в консоль и файл с обработкой ошибок"""
-    try:
-        # Создаем директорию для логов, если её нет
-        log_dir = Path("logs")
-        try:
-            log_dir.mkdir(exist_ok=True, mode=0o755)
-        except Exception as e:
-            print(f"Не удалось создать директорию логов: {e}", file=sys.stderr)
-            raise
+    """Настройка логирования с цветным выводом в консоль и записью в файл"""
+    colorama.init()  # Инициализация colorama для поддержки цветов в Windows
 
-        COLORS = {
-            'DEBUG': '\033[94m',  # Синий
-            'INFO': '\033[92m',  # Зелёный
-            'WARNING': '\033[93m',  # Жёлтый
-            'ERROR': '\033[91m',  # Красный
-            'CRITICAL': '\033[41m',  # Красный фон
-            'RESET': '\033[0m'  # Сброс цвета
-        }
+    try:
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True, mode=0o755)  # Создаем директорию один раз
 
         class ColorFormatter(logging.Formatter):
-            def format(self, record):
-                level_color = COLORS.get(record.levelname, COLORS['RESET'])
-                message = super().format(record)
-                return (
-                    f"{level_color}"
-                    f"{message}"
-                    f"{COLORS['RESET']}"
-                )
+            CUSTOM_RULES = {
+                "Обнаружено окончание матча": colorama.Fore.CYAN,
+                "Обнаружено начало матча": colorama.Fore.MAGENTA,
+            }
+            # Цвета через colorama для кроссплатформенной поддержки
+            COLORS = {
+                'DEBUG': colorama.Fore.BLUE,
+                'INFO': colorama.Fore.GREEN,
+                'WARNING': colorama.Fore.YELLOW,
+                'ERROR': colorama.Fore.RED,
+                'CRITICAL': colorama.Back.RED + colorama.Fore.WHITE,
+                'RESET': colorama.Style.RESET_ALL,
+            }
 
-        log_format = (
-            "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
-        )
+            def format(self, record):
+                msg = record.getMessage()
+                color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
+
+                for pattern, pattern_color in self.CUSTOM_RULES.items():
+                    if pattern in msg:
+                        color = pattern_color
+                        break
+
+                return f"{color}{super().format(record)}{self.COLORS['RESET']}"
+
+        log_format = "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
         date_format = "%Y-%m-%d %H:%M:%S"
 
-        # Форматтер для файла (без цветов)
-        file_formatter = logging.Formatter(log_format, datefmt=date_format)
-
-        # Форматтер для консоли (с цветами)
-        console_formatter = ColorFormatter(
-            f"{COLORS['RESET']}{log_format}",
-            datefmt=date_format
-        )
-
-        logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG)
-
-        logging.getLogger('motor.core').setLevel(logging.WARNING)
-        logging.getLogger('motor.monitoring').setLevel(logging.WARNING)
-        logging.getLogger('pymongo.monitoring').setLevel(logging.WARNING)
-        logging.getLogger('pymongo').setLevel(logging.WARNING)
-        logging.getLogger('mongodb').setLevel(logging.WARNING)
-
-        logging.getLogger('discord').setLevel(logging.WARNING)
-        logging.getLogger('discord.gateway').setLevel(logging.WARNING)
-        logging.getLogger('discord.client').setLevel(logging.INFO)
-
-        # 1. Консольный вывод с цветами
+        # Создаем и настраиваем обработчики
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
-        console_handler.setFormatter(console_formatter)  # Используем цветной форматтер
+        console_handler.setLevel(logging.DEBUG)  # Уровень для консоли
+        console_handler.setFormatter(ColorFormatter(log_format, date_format))
+
+        file_handler = RotatingFileHandler(
+            filename=log_dir / "application.log",
+            maxBytes=100 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8"
+        )
+        file_handler.setLevel(logging.DEBUG)  # Уровень для файла
+        file_handler.setFormatter(logging.Formatter(log_format, date_format))
+
+        # Настройка корневого логгера
+        logger = logging.getLogger()
+        logger.setLevel(logging.DEBUG)  # Минимальный уровень для обработки
+
+        # Очистка старых обработчиков
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+
+        # Добавляем новые обработчики
         logger.addHandler(console_handler)
+        logger.addHandler(file_handler)
 
-        # 2. Файловый вывод (без цветов)
-        log_file = log_dir / "application.log"
-        try:
-            file_handler = RotatingFileHandler(
-                filename=log_file,
-                maxBytes=100 * 1024 * 1024,
-                backupCount=5,
-                encoding='utf-8'
-            )
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(file_formatter)  # Обычный форматтер
-            logger.addHandler(file_handler)
-
-        except PermissionError:
-            logger.error(f"Нет прав на запись в файл логов: {log_file}")
-        except Exception as e:
-            logger.error(f"Ошибка при настройке файлового логирования: {e}")
-
-        # Перехват необработанных исключений
-        sys.excepthook = lambda t, v, tb: logger.critical("Необработанное исключение")
+        # Настройка сторонних логгеров
+        for lib in ['motor', 'pymongo', 'discord']:
+            logging.getLogger(lib).setLevel(logging.WARNING)
 
         return logger
 
     except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА при настройке логирования: {e}", file=sys.stderr)
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", file=sys.stderr)
         raise
 
 
@@ -1141,29 +1152,36 @@ async def verify_log_file(log_path):
         return False
 
 
+DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+
+
+@bot.event
+async def on_ready():
+    """Обработчик события запуска бота"""
+    logging.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
+    logging.info(f'Доступные серверы: {len(bot.guilds)}')
+    for guild in bot.guilds:
+        logging.info(f'- {guild.name} (ID: {guild.id})')
+    await main()  # Запуск основной логики после подключения бота
+
+
 async def main():
-    # Инициализация логирования
+    """Основная асинхронная логика приложения"""
     logger = setup_logging()
     logger.info("Инициализация приложения")
 
     # Инициализация MongoDB
     for server in SERVERS:
         try:
-            logger.debug(f"Подключение к MongoDB: {server['name']}")
             client = AsyncIOMotorClient(
                 server["mongo_uri"],
                 serverSelectionTimeoutMS=5000,
                 connectTimeoutMS=10000,
                 socketTimeoutMS=30000
             )
-
             await client.admin.command('ping')
             mongo_clients[server["name"]] = client
-
-            db = client[server["db_name"]]
-            collections = await db.list_collection_names()
-            logger.info(f"MongoDB подключен: {server['name']}. Коллекции: {collections}")
-
+            logger.info(f"MongoDB подключен: {server['name']}")
         except Exception as e:
             logger.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
             continue
@@ -1175,8 +1193,6 @@ async def main():
             if not await verify_log_file(server["logFilePath"]):
                 continue
 
-            logger.debug(f"Запуск наблюдателя для: {server['name']}")
-
             handler = SquadLogHandler(server["logFilePath"], server, asyncio.get_running_loop())
             observer = Observer()
             observer.schedule(handler, os.path.dirname(server["logFilePath"]))
@@ -1187,69 +1203,53 @@ async def main():
                 daemon=True
             )
             observer_thread.start()
-
             observers.append((observer, observer_thread, handler))
             logger.info(f"Мониторинг логов запущен: {server['name']}")
 
         except Exception as e:
             logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
 
+    # Инициализация записей матчей
     for server in SERVERS:
         try:
             await create_initial_match_record(server)
         except Exception as e:
-            logger.error(f"Не удалось создать начальную запись для сервера {server['name']}: {e}")
+            logger.error(f"Ошибка инициализации матча: {e}")
 
-    # Настройка Discord бота
-    try:
-        logger.debug("Инициализация Discord бота")
-        intents = discord.Intents.default()
-        intents.message_content = True
 
-        bot = commands.Bot(command_prefix='!', intents=intents)
+async def shutdown(observers):
+    """Корректное завершение работы"""
+    logging.info("Завершение работы приложения")
 
-        @bot.event
-        async def on_ready():
-            logger.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
+    # Остановка наблюдателей
+    for observer, thread, handler in observers:
+        try:
+            handler.shutdown()
+            observer.stop()
+            thread.join(timeout=5)
+            logging.info(f"Наблюдатель остановлен: {handler.server['name']}")
+        except Exception as e:
+            logging.error(f"Ошибка остановки наблюдателя: {str(e)}")
 
-            # Токен должен храниться в переменных окружения или конфиг-файле
-
-        DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")  # Используйте переменные окружения
-
-        if not DISCORD_TOKEN:
-            raise ValueError("Discord token not found in environment variables")
-
-        logger.info("Запуск Discord бота")
-        await bot.start(DISCORD_TOKEN)
-
-    finally:
-        logger.info("Завершение работы приложения")
-
-        # Остановка наблюдателей
-        for observer, thread, handler in observers:
-            try:
-                handler.shutdown()
-                observer.stop()
-                thread.join(timeout=5)
-                logger.info(f"Наблюдатель остановлен: {handler.server['name']}")
-            except Exception as e:
-                logger.error(f"Ошибка остановки наблюдателя: {str(e)}")
-
-        # Закрытие подключений MongoDB
-        for name, client in mongo_clients.items():
-            try:
-                client.close()
-                await asyncio.sleep(0.1)
-                logger.info(f"MongoDB отключен: {name}")
-            except Exception as e:
-                logger.error(f"Ошибка закрытия MongoDB: {str(e)}")
-
-        logger.info("Приложение завершено")
+    # Закрытие подключений MongoDB
+    for name, client in mongo_clients.items():
+        try:
+            client.close()
+            await asyncio.sleep(0.1)
+            logging.info(f"MongoDB отключен: {name}")
+        except Exception as e:
+            logging.error(f"Ошибка закрытия MongoDB: {str(e)}")
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # Используйте токен из переменных окружения
+        DISCORD_TOKEN = DISCORD_TOKEN
+        if not DISCORD_TOKEN:
+            raise ValueError("Токен Discord не найден!")
+
+        bot.run(DISCORD_TOKEN)  # Единственная точка входа для бота
+
     except KeyboardInterrupt:
         logging.info("Приложение остановлено пользователем")
     except Exception as e:
