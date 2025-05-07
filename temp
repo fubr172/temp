@@ -1,74 +1,70 @@
-REGEX_CONNECT = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"  # Группа 1: timestamp
-    r"\]\["
-    r"(\d+)"  # Группа 2: thread ID
-    r"\]"
-    r"LogSquad: PostLogin: NewPlayer: "
-    r"([\w_]+)"  # Группа 3: player name
-    r" "
-    r"([^\s]+)"  # Группа 4: unknown field
-    r" \(IP: (\d{1,3}(?:\.\d{1,3}){3})"  # Группа 5: IP
-    r" \| Online IDs: EOS: ([a-f0-9]+)"  # Группа 6: EOS ID
-    r" steam: (\d+)\)"  # Группа 7: SteamID
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
+
+# Регулярное выражение для парсинга убийств
+REGEX_KILL = re.compile(
+    r"\[.*\]LogSquad: Player: .*? from ([^\s]+) \(.*steam: (\d+).*?caused by ([^\s]+)"
 )
 
-# Обновленный REGEX_VEHICLE
-REGEX_VEHICLE = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"  # Группа 1: timestamp
-    r"\]\["
-    r"\d+"  # Пропускаем thread ID
-    r"\]"
-    r"LogSquadTrace: \[DedicatedServer\]ASQPlayerController::OnPossess\(\): PC=([^\s]+)"  # Группа 2: player name
-    r" \(.*steam: (\d+)\).*Pawn=(BP_[A-Za-z0-9_]+)"  # Группа 3: SteamID, Группа 4: vehicle type
-)
+# Хранилище статистики убийств
+kill_tracker = defaultdict(lambda: defaultdict(deque))
 
 async def process_log_line(line, server):
-    server_name = server["name"]
-    
+    # Обработка убийств
+    if kill_match := REGEX_KILL.search(line):
+        try:
+            attacker_name = kill_match.group(1)
+            steam_id = kill_match.group(2)
+            weapon = kill_match.group(3)
+            current_time = datetime.now(timezone.utc)
+
+            # Добавляем время убийства в трекер
+            times = kill_tracker[steam_id][weapon]
+            times.append(current_time)
+
+            # Проверяем временной интервал
+            while times and (current_time - times[0]) > timedelta(seconds=1):
+                times.popleft()
+
+            # Если достигли порога в 5 убийств
+            if len(times) >= 5:
+                await send_suspect_message(server, attacker_name, steam_id, weapon)
+                # Очищаем историю после отправки
+                kill_tracker[steam_id][weapon].clear()
+
+        except Exception as e:
+            logging.error(f"Kill processing error: {str(e)}")
+
+async def send_suspect_message(server, name, steam_id, weapon):
     try:
-        if not line.strip():
+        channel = bot.get_channel(server["report_channel_id"])
+        if not channel:
             return
 
-        # Обработка подключения игрока
-        if match := REGEX_CONNECT.search(line):
-            steam_id = match.group(7)
-            eos_id = match.group(6)
-            player_name = match.group(3)  # Правильная группа для имени
-            
-            success = await add_player_to_match(server, steam_id, eos_id, player_name)
-            if success:
-                logging.info(f"[{server_name}] Игрок подключен: {player_name} ({steam_id})")
-            else:
-                logging.warning(f"[{server_name}] Ошибка добавления игрока: {player_name}")
-            return
+        embed = discord.Embed(
+            title="⚠️ Подозрительная активность",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Игрок", value=name, inline=False)
+        embed.add_field(name="SteamID", value=f"`{steam_id}`", inline=False)
+        embed.add_field(name="Оружие", value=weapon, inline=False)
+        embed.add_field(
+            name="Статистика", 
+            value="5+ убийств за 1 секунду", 
+            inline=False
+        )
 
-        # Обработка взятия техники
-        if match := REGEX_VEHICLE.search(line):
-            timestamp = match.group(1)
-            player_name = match.group(2)  # Группа 2 - player name
-            steam_id = match.group(3)
-            vehicle_type = match.group(4)
-            
-            vehicle_name = vehicle_mapping.get(vehicle_type, "Неизвестная техника")
-            await send_vehicle_message(server, player_name, steam_id, vehicle_name)
-            return
-
-        # Остальная обработка...
+        await channel.send(embed=embed)
+        logging.info(f"Sent suspect alert for {name} ({steam_id})")
 
     except Exception as e:
-        logging.error(f"[{server_name}] Ошибка обработки строки: {str(e)}")
-        logging.debug(f"Проблемная строка: {line}")  # Добавляем логирование проблемной строки
+        logging.error(f"Error sending suspect alert: {str(e)}")
 
-# Добавляем проверки в функцию отправки
-async def send_vehicle_message(server, player_name, steam_id, vehicle_name):
-    try:
-        if not player_name:
-            player_name = "Неизвестный игрок"
-            
-        if not steam_id.isdigit():
-            logging.error(f"Некорректный SteamID: {steam_id}")
-            return
-
-        # Остальная часть функции без изменений...
+# Добавить в SERVERS конфигурацию
+SERVERS = [
+    {
+        # ... другие параметры
+        "report_channel_id": 1234567890  # ID канала для отчетов
+    }
+]
