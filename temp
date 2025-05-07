@@ -1,16 +1,4 @@
-from collections import defaultdict, deque
-from datetime import datetime, timedelta
-
-# Регулярное выражение для парсинга убийств
-REGEX_KILL = re.compile(
-    r"\[.*\]LogSquad: Player: .*? from ([^\s]+) \(.*steam: (\d+).*?caused by ([^\s]+)"
-)
-
-# Хранилище статистики убийств
-kill_tracker = defaultdict(lambda: defaultdict(deque))
-
 async def process_log_line(line, server):
-    # Обработка убийств
     if kill_match := REGEX_KILL.search(line):
         try:
             attacker_name = kill_match.group(1)
@@ -18,53 +6,50 @@ async def process_log_line(line, server):
             weapon = kill_match.group(3)
             current_time = datetime.now(timezone.utc)
 
-            # Добавляем время убийства в трекер
-            times = kill_tracker[steam_id][weapon]
+            # Проверяем оружие по паттернам
+            is_rifle = False
+            for weapon_pattern in RIFLE_WEAPONS.values():
+                if weapon_pattern.fullmatch(weapon):
+                    is_rifle = True
+                    break
+                elif weapon_pattern.search(weapon):
+                    is_rifle = True
+                    break
+
+            if not is_rifle:
+                return
+
+            # Обновляем статистику только для винтовок
+            times = kill_tracker[steam_id]['rifle_kills']
             times.append(current_time)
 
-            # Проверяем временной интервал
+            # Очищаем старые записи
             while times and (current_time - times[0]) > timedelta(seconds=1):
                 times.popleft()
 
-            # Если достигли порога в 5 убийств
             if len(times) >= 5:
-                await send_suspect_message(server, attacker_name, steam_id, weapon)
-                # Очищаем историю после отправки
-                kill_tracker[steam_id][weapon].clear()
+                await send_suspect_message(
+                    server, 
+                    attacker_name, 
+                    steam_id, 
+                    "Rifle weapon", 
+                    weapon
+                )
+                times.clear()
 
         except Exception as e:
             logging.error(f"Kill processing error: {str(e)}")
 
-async def send_suspect_message(server, name, steam_id, weapon):
-    try:
-        channel = bot.get_channel(server["report_channel_id"])
-        if not channel:
-            return
-
-        embed = discord.Embed(
-            title="⚠️ Подозрительная активность",
-            color=discord.Color.red(),
-            timestamp=datetime.now(timezone.utc)
+async def send_suspect_message(server, name, steam_id, weapon_type, weapon):
+    embed = discord.Embed(
+        title="🚨 Подозрительная активность с огнестрельным оружием",
+        color=0xFF4500,
+        description=(
+            f"**Игрок:** {name}\n"
+            f"**SteamID:** `{steam_id}`\n"
+            f"**Тип оружия:** {weapon_type}\n"
+            f"**Конкретное оружие:** {weapon}\n"
+            f"**Нарушение:** 5+ убийств за 1 секунду"
         )
-        embed.add_field(name="Игрок", value=name, inline=False)
-        embed.add_field(name="SteamID", value=f"`{steam_id}`", inline=False)
-        embed.add_field(name="Оружие", value=weapon, inline=False)
-        embed.add_field(
-            name="Статистика", 
-            value="5+ убийств за 1 секунду", 
-            inline=False
-        )
-
-        await channel.send(embed=embed)
-        logging.info(f"Sent suspect alert for {name} ({steam_id})")
-
-    except Exception as e:
-        logging.error(f"Error sending suspect alert: {str(e)}")
-
-# Добавить в SERVERS конфигурацию
-SERVERS = [
-    {
-        # ... другие параметры
-        "report_channel_id": 1234567890  # ID канала для отчетов
-    }
-]
+    )
+    # ... отправка сообщения
