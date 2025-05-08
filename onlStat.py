@@ -1895,42 +1895,120 @@ async def send_suspect_message(server, name, steam_id, weapon):
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEM")
 
-class Bot(commands.Bot):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mongo_clients: Dict[str, AsyncIOMotorClient] = {}
-        self.observers: List[Tuple[Observer, threading.Thread]] = []
-        self.stop_event = asyncio.Event()
-        self._background_tasks: List[asyncio.Task] = []
+@bot.event
+async def on_ready() -> None:
+    """Обработчик события успешного запуска бота"""
+    logger.info(f"Бот {bot.user} успешно запущен!")
+    await bot.change_presence(activity=discord.Game(name="Squad Statistics"))
 
-    async def setup_hook(self) -> None:
-        """Инициализация расширений при старте бота"""
-        await self.load_extension("cogs.stats")
-        await self.load_extension("cogs.admin")
+    try:
+        # Инициализация подключений к MongoDB
+        for server in SERVERS:
+            try:
+                client = AsyncIOMotorClient(
+                    MONGO_URI,
+                    serverSelectionTimeoutMS=5000,
+                    connectTimeoutMS=10000,
+                    socketTimeoutMS=30000
+                )
+                await client.admin.command('ping')
+                bot.mongo_clients[server["name"]] = client
+                logger.info(f"MongoDB подключен для {server['name']}")
+            except PyMongoError as e:
+                logger.error(f"Ошибка подключения к MongoDB ({server['name']}): {e}")
+                continue
 
-    async def close(self) -> None:
-        """Корректное завершение работы бота"""
-        await self.shutdown()
-        await super().close()
+        # Запуск фоновых задач
+        bot._background_tasks.extend([
+            asyncio.create_task(background_stats_updater()),
+            asyncio.create_task(log_watcher()),
+            asyncio.create_task(schedule_weekly_report()),
+            asyncio.create_task(schedule_daily_report())
+        ])
 
-    async def shutdown(self) -> None:
-        """Процедура завершения работы с освобождением ресурсов"""
-        logger.info("Начало завершения работы...")
+    except Exception as e:
+        logger.critical(f"Критическая ошибка инициализации: {e}")
+        await bot.close()
 
-        # Отмена всех фоновых задач
-        for task in self._background_tasks:
-            task.cancel()
+async def background_stats_updater() -> None:
+    """Фоновая задача для периодического обновления статистики"""
+    while not bot.stop_event.is_set():
+        try:
+            # Логика обновления статистики
+            logger.info("Запуск обновления статистики...")
+            await asyncio.sleep(3600)  # Интервал обновления - 1 час
+        except asyncio.CancelledError:
+            logger.info("Задача обновления статистики отменена")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в фоновой задаче: {e}")
+            await asyncio.sleep(60)
 
-        # Остановка наблюдателей
-        for observer, thread in self.observers:
-            observer.stop()
-            thread.join(timeout=5)
+async def log_watcher() -> None:
+    """Мониторинг лог-файлов серверов"""
+    for server in SERVERS:
+        try:
+            log_path = Path(server["log_file"])
+            if not log_path.parent.exists():
+                log_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Закрытие подключений MongoDB
-        for name, client in self.mongo_clients.items():
-            await client.close()
+            observer = Observer()
+            handler = SquadLogHandler(str(log_path), server)
+            observer.schedule(handler, str(log_path.parent))
 
-        logger.info("Все ресурсы освобождены")
+            thread = threading.Thread(
+                target=observer.start,
+                daemon=True,
+                name=f"LogWatcher-{server['name']}"
+            )
+            thread.start()
+            bot.observers.append((observer, thread))
+            logger.info(f"Мониторинг логов запущен для {server['name']}")
 
+        except Exception as e:
+            logger.error(f"Ошибка запуска наблюдателя для {server['name']}: {e}")
 
-bot = Bot(command_prefix="!", intents=discord.Intents.all())
+async def schedule_weekly_report() -> None:
+    """Планировщик еженедельных отчетов"""
+    while not bot.stop_event.is_set():
+        try:
+            # Логика расчета времени и отправки отчетов
+            await asyncio.sleep(3600)  # Временная заглушка
+        except asyncio.CancelledError:
+            logger.info("Еженедельный планировщик отменен")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в еженедельном планировщике: {e}")
+
+async def schedule_daily_report() -> None:
+    """Планировщик ежедневных отчетов"""
+    while not bot.stop_event.is_set():
+        try:
+            # Логика расчета времени и отправки отчетов
+            await asyncio.sleep(3600)  # Временная заглушка
+        except asyncio.CancelledError:
+            logger.info("Ежедневный планировщик отменен")
+            break
+        except Exception as e:
+            logger.error(f"Ошибка в ежедневном планировщике: {e}")
+
+def signal_handler(sig: int, frame: any) -> None:
+    """Обработчик системных сигналов"""
+    logger.info(f"Получен сигнал {sig}, инициирую завершение работы...")
+    bot.loop.create_task(bot.shutdown())
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        logger.critical("Токен Discord не найден в переменных окружения!")
+        sys.exit(1)
+
+    try:
+        bot.run(DISCORD_TOKEN)
+    except KeyboardInterrupt:
+        logger.info("Работа приложения прервана пользователем")
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}")
+        sys.exit(1)
