@@ -1,7 +1,4 @@
 import asyncio
-import signal
-from typing import Dict, List, Tuple
-
 import aiofiles
 import pymongo
 import threading
@@ -14,21 +11,14 @@ import colorama
 
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
-
-from discord import embeds
 from motor.motor_asyncio import AsyncIOMotorClient
 from motor.core import AgnosticCollection
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pymongo.errors import PyMongoError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from discord.ext import commands
 from pymongo import UpdateOne
-from collections import defaultdict, deque
-
-REGEX_KILL = re.compile(
-    r"\[.*\]LogSquad: Player: .*? from ([^\s]+) \(.*steam: (\d+).*?caused by ([^\s]+)"
-)
 
 REGEX_MATCH_START = re.compile(
     r"\["
@@ -60,9 +50,7 @@ REGEX_CONNECT = re.compile(
     r"([\w_]+)"
     r" "
     r"([^\s]+)"
-    r" \(IP: (\d{1,3}(?:\.\d{1,3}){3})"
-    r" \| Online IDs: EOS: ([a-f0-9]+)"
-    r" steam: (\d+)\)"
+    r" \(IP: (\d{1,3}(?:\.\d{1,3}){3}) \| Online IDs: EOS: ([a-f0-9]+) steam: (\d+)\)"
 )
 
 REGEX_DISCONNECT = re.compile(
@@ -70,16 +58,6 @@ REGEX_DISCONNECT = re.compile(
     r"\[\d+\]"
     r"LogNet: UChannel::Close: Sending CloseBunch.*"
     r"UniqueId: RedpointEOS:([a-f0-9]+)"
-)
-
-REGEX_VEHICLE = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
-    r"\]\["
-    r"\d+"
-    r"\]"
-    r"LogSquadTrace: \[DedicatedServer\]ASQPlayerController::OnPossess\(\): PC=([^\s]+)"
-    r" \(.*steam: (\d+)\).*Pawn=(BP_[A-Za-z0-9_]+)"
 )
 
 IGNORED_ROLE_PATTERNS = [
@@ -288,9 +266,7 @@ SERVERS = [
         "collection_name": "Player",
         "onl_stats_collection_name": "onl_stats",
         "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039,
-        "vehicle_dis_id": 1354167956359217174,
-        "report_channel_id": 1342558413112217722,
+        "discord_channel_id": 1368641402816299039
     },
     {
         "name": "ZAVOD2",
@@ -301,15 +277,10 @@ SERVERS = [
         "collection_name": "Player",
         "onl_stats_collection_name": "onl_stats",
         "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039,
-        "vehicle_dis_id": 1342186502821511278,
-        "report_channel_id": 1342558413112217722,
+        "discord_channel_id": 1368641402816299039
     }
 
 ]
-
-DAILY_STATS_CHANNEL_ID = 1234
-WEEKLY_STATS_CHANNEL_ID = 1234
 
 logging.basicConfig(
     level=logging.INFO,
@@ -321,49 +292,6 @@ logger = logging.getLogger(__name__)
 
 mongo_clients = {}
 
-VEHICLE_EVENT_CACHE = deque(maxlen=100)
-EVENT_COOLDOWN = 300
-
-
-class Bot(commands.Bot):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.mongo_clients: Dict[str, AsyncIOMotorClient] = {}
-        self.observers: List[Tuple[Observer, threading.Thread]] = []
-        self.stop_event = asyncio.Event()
-        self._background_tasks: List[asyncio.Task] = []
-
-    async def setup_hook(self) -> None:
-        """Инициализация расширений при старте бота"""
-        await self.load_extension("cogs.stats")
-        await self.load_extension("cogs.admin")
-
-    async def close(self) -> None:
-        """Корректное завершение работы бота"""
-        await self.shutdown()
-        await super().close()
-
-    async def shutdown(self) -> None:
-        """Процедура завершения работы с освобождением ресурсов"""
-        logger.info("Начало завершения работы...")
-
-        # Отмена всех фоновых задач
-        for task in self._background_tasks:
-            task.cancel()
-
-        # Остановка наблюдателей
-        for observer, thread in self.observers:
-            observer.stop()
-            thread.join(timeout=5)
-
-        # Закрытие подключений MongoDB
-        for name, client in self.mongo_clients.items():
-            await client.close()
-
-        logger.info("Все ресурсы освобождены")
-
-
-bot = Bot(command_prefix="!", intents=discord.Intents.all())
 
 async def get_match_collection(server):
     """Получает коллекцию matches для указанного сервера, создает если не существует"""
@@ -506,8 +434,12 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
 
         # Ищем активный матч
         match = await match_collection.find_one({
-            "server_name": server["name"],
+            "server_name": server["name"]
         })
+
+        if not match:
+            logging.warning(f"Активный матч не найден на сервере {server['name']}")
+            return
 
         existing_players = match.get("players", [])
         for player in existing_players:
@@ -552,24 +484,19 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
 async def player_disconnect(server, eos_id):
     if not eos_id or not isinstance(eos_id, str):
         logging.error(f"Invalid EOS ID: {eos_id}")
-
         return False
 
     try:
-        client = mongo_clients.get(server["name"])
-        if not client:
-            logging.error(f"MongoDB для сервера {server["name"]} не инициализирован")
-            return False
-
-        db = client[server["db_name"]]
-        match_collection = db[server["matches_collection_name"]]
+        match_collection = await get_match_collection(server)
 
         active_match = await match_collection.find_one({
             "server_name": server["name"],
         })
 
-        if not active_match:
-            logging.debug(f"Активный матч не найден на сервере {server["name"]}")
+
+        disconnect = active_match.get("disconnected_players", [])
+        if eos_id in disconnect:
+            logging.debug(f"Игрок {eos_id} уже находится в списке отключившихся {server['name']}")
             return False
 
         result = await match_collection.update_one(
@@ -581,31 +508,18 @@ async def player_disconnect(server, eos_id):
         )
 
         if result.modified_count == 1:
-            player_collection = db[server["collection_name"]]
-            player = await player_collection.find_one({"eosid": eos_id})
-
-            if player:
-                onl_stats_collection = db[server["onl_stats_collection_name"]]
-                await onl_stats_collection.update_one(
-                    {"steam": player["_id"], "eos": None},
-                    {"$set": {"eos": eos_id}},
-                    upsert=False
-                )
-                logging.info(f"Обновлена статистика для SteamID {player["_id"]}")
-            else:
-                logging.warning(f"Игрок с EOS {eos_id} не найден в колекции ")
-
             return True
 
-        logging.warning(f"Откдючении игрока {eos_id} не зарегестрировано (дубликат или ошибка)")
+        logging.warning(f"Не удалось зарегистрировать отключение для {eos_id} (возможный дубликат)")
         return False
 
     except Exception as e:
-        logging.error(f"Ошибка обработки отключения: {str(e)}")
+        logging.error(f"Ошибка обработки отключения для{eos_id}: {str(e)}")
         return False
 
 
 async def end_match(server):
+    print('Функция end_match работает')
     try:
         match_collection = await get_match_collection(server)
         match = await match_collection.find_one({"server_name": server["name"], "active": True})
@@ -645,16 +559,15 @@ async def end_match(server):
             f"Матч завершён на сервере {server['name']}. "
             f"Продолжительность: {round(duration_minutes, 1)} мин."
         )
-
+        logging.info('Функция calculate_final_stats запустилась')
         await calculate_final_stats(server)
+        logging.info('Функция calculate_final_stats завершилась')
         return True
 
     except Exception as e:
         logging.error(f"Ошибка при завершении матча {server['name']}: {str(e)}")
         return False
 
-
-kill_tracker = defaultdict(lambda: defaultdict(deque))
 
 intents = discord.Intents.default()
 intents.messages = True
@@ -734,91 +647,21 @@ async def process_log_line(line, server):
         if match := REGEX_CONNECT.search(line):
             steam_id = match.group(7)
             eos_id = match.group(6)
-            player_name = match.group(3)
-
-            success = await add_player_to_match(server, steam_id, eos_id, player_name)
+            player_name = match.group(5)  # Изменено с group(5) на group(3) для правильного имени
+            success = await add_player_to_match(server, steam_id, eos_id)
             if success:
-                logging.info(f"[{server_name}] Игрок подключен: {player_name} ({steam_id})")
-            else:
-                logging.warning(f"[{server_name}] Ошибка добавления игрока: {player_name}")
-            return
+                if success:
+                    logging.debug(
+                        f"[{server_name}] Игрок подключен и добавлен в БД: {player_name} (SteamID: {steam_id})")
+                else:
+                    logging.warning(
+                        f"[{server_name}] Не удалось добавить игрока в БД: {player_name} (SteamID: {steam_id})")
 
         if match := REGEX_DISCONNECT.search(line):
             eos_id = match.group(1)
             await player_disconnect(server, eos_id)
             logging.debug(f"[{server_name}] Игрок отключился (EOS ID: {eos_id})")
             return
-
-        if match := REGEX_VEHICLE.search(line):
-            timestamp = datetime.now(timezone.utc).timestamp()
-            player_name = match.group(2)
-            steam_id = match.group(3)
-            vehicle_type = match.group(4)
-
-            event_key = f"{steam_id}-{vehicle_type}-{int(timestamp // EVENT_COOLDOWN)}"
-
-            if event_key in VEHICLE_EVENT_CACHE:
-                logging.debug(f"Дубликат события: {event_key}")
-                return
-
-            VEHICLE_EVENT_CACHE.append(event_key)
-
-            vehicle_name = None
-
-            if vehicle_type in vehicle_mapping:
-                vehicle_name = vehicle_mapping[vehicle_type]
-
-            else:
-                for key, value in vehicle_mapping.items():
-                    if key in vehicle_type:
-                        vehicle_name = value
-                        break
-
-            if vehicle_name:
-                await send_vehicle_message(server, player_name, steam_id, vehicle_name)
-
-            return
-
-        if kill_match := REGEX_KILL.search(line):
-
-            attacker_name = kill_match.group(1)
-            steam_id = kill_match.group(2)
-            weapon = kill_match.group(3)
-            current_time = datetime.now(timezone.utc)
-
-            # Проверяем оружие по паттернам
-            is_rifle = False
-            for weapon_pattern in RIFLE_WEAPONS.values():
-                if weapon_pattern.fullmatch(weapon):
-                    is_rifle = True
-                    break
-                elif weapon_pattern.search(weapon):
-                    is_rifle = True
-                    break
-
-            if not is_rifle:
-                return
-
-            # Обновляем статистику только для винтовок
-            times = kill_tracker[steam_id]['rifle_kills']
-            times.append(current_time)
-
-            # Очищаем старые записи
-            while times and (current_time - times[0]) > timedelta(seconds=2):
-                times.popleft()
-
-            if len(times) >= 5:
-                await send_suspect_message(
-                    server,
-                    attacker_name,
-                    steam_id,
-                    "Rifle weapon",
-                    weapon
-                )
-                times.clear()
-
-
-
 
     except ValueError as ve:
         logging.error(f"[{server_name}] Ошибка валидации: {ve}")
@@ -875,6 +718,7 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
 
 
 async def remove_disconnected_players(server):
+    logging.info('Начинаем удаление отключившихся игроков')
     server_name = server["name"]
     client = mongo_clients.get(server_name)
     if not client:
@@ -915,6 +759,9 @@ async def remove_disconnected_players(server):
             elif eos is None:
                 steam_ids_with_null_eos.append(str(player["_id"]))
 
+        logging.info(f"EOS для удаления: {eos_to_remove}")
+        logging.info(f"SteamID с null EOS для удаления")
+
         if steam_ids_with_null_eos:
             users_with_eos = await db[server["collection_name"]].find(
                 {"_id": {"$in": steam_ids_with_null_eos}},
@@ -937,7 +784,9 @@ async def remove_disconnected_players(server):
         }
 
         if steam_ids_to_remove:
-            update_operations["$pull"] = {"players": {"steam_id": {"$in": steam_ids_to_remove}}}
+            update_operations["$pull"] = {
+                "players": {
+                    "steam_id": {"$in": steam_ids_to_remove}}}
             logging.info(f"Подготавливаем удаление SteamID из матча")
 
         update_result = await db[server["matches_collection_name"]].update_one(
@@ -964,6 +813,7 @@ async def remove_disconnected_players(server):
 
 async def calculate_final_stats(server: dict) -> None:
     """Вычисляет и сохраняет финальную статистику матча с учётом onl_stats"""
+    print("Запуск функции calculate_final_stats")
     try:
         server_name = server["name"]
         logging.info(f'{server_name} расчет статы')
@@ -1019,10 +869,11 @@ async def calculate_final_stats(server: dict) -> None:
         if not diffs:
             logging.warning(f"[{server_name}] Нет данных для расчета разницы статистики")
             return
-
+        logging.info("Функция send_discord_report запустилась")
         await send_discord_report(diffs, server)
         await asyncio.sleep(3)
         await update_onl_stats(diffs, server)
+
 
         logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
@@ -1072,7 +923,7 @@ async def send_discord_report(diffs, server):
         if not channel:
             logging.info(f"[{server['name']}] Discord канал недоступен")
             return
-        logging.info(f"{server["name"]} нашёл канал")
+        logging.error(f"{server["name"]} нашёл канал")
         # Основное сообщение
         await channel.send(f"📊 **Отчёт по изменению статистики на сервере {server['name']}**")
 
@@ -1128,12 +979,15 @@ async def send_discord_report(diffs, server):
                 )
             await channel.send(embed=tech_embed)
 
+        print("функция закончила работу")
+
     except discord.errors.Forbidden:
         logging.error(f"[{server['name']}] Ошибка доступа к каналу Discord")
         return
     except Exception as e:
         logging.error(f"[{server['name']}] Ошибка отправки отчёта: {str(e)}")
         return
+
 
     except Exception as e:
         logging.error(f"Ошибка в sen_discord: {str(e)}")
@@ -1142,6 +996,7 @@ async def send_discord_report(diffs, server):
 
 async def update_onl_stats(players, server):
     """Обновляет статистику в коллекции onl_stats текущими значениями"""
+
     logging.info(f"[{server['name']}] Начинается обновление статистики игроков")
     try:
         if not players:
@@ -1202,7 +1057,9 @@ async def update_onl_stats(players, server):
         else:
             logging.info(f"[{server['name']}] Нет операций для записи в bulk_write")
 
+        await asyncio.sleep(3)
         await remove_disconnected_players(server)
+
 
     except pymongo.errors.BulkWriteError as e:
         logging.error(f"[{server['name']}] Ошибка пакетного обновления: {e.details}")
@@ -1239,532 +1096,6 @@ def get_tech_kills(weapons):
         any(pattern.search(weapon) for pattern in FILTERED_VEHICLE_PATTERNS.values())
     )
 
-
-async def send_vehicle_message(server, player_name, steam_id, vehicle_name):
-    try:
-        if not player_name:
-            player_name = "Неизвестный игрок"
-
-        if not steam_id.isdigit():
-            logging.error(f"Некорректный SteamID: {steam_id}")
-            return
-
-        channel_id = server.get('vehicle_dis_id')
-        if not channel_id:
-            logging.error(f"Канал не найден в конфигурации сервера {server["name"]}")
-            return
-
-        channel = bot.get_channel(channel_id)
-        if not channel:
-            logging.error(f"Дискорд канал не найден {channel_id}")
-            return
-
-        embed = discord.Embed(
-            title="Клейм техники",
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc)
-        )
-        embed.add_field(name="Игрок", value=player_name, inline=True)
-        embed.add_field(name="SteamID", value=f"`{steam_id}`", inline=True)
-        embed.add_field(name="Техника", value=vehicle_name, inline=False)
-
-        for embed in embeds:
-            await channel.send(embed=embed)
-            await asyncio.sleep(1)
-            logging.info(f'Сообщение о транспорте отправлено для {player_name} ({steam_id})')
-
-    except Exception as e:
-        logging.error(f"Ошибка отправки сообщения (о клейме техники): {str(e)}")
-
-
-
-
-
-
-def get_filtered_vehicle_patterns():
-    if not hasattr(get_filtered_vehicle_patterns, "_cache"):
-        ignore_patterns = COMPILED_IGNORED_ROLE_PATTERNS + tuple(RIFLE_WEAPONS.values())
-        get_filtered_vehicle_patterns._cache = {
-            k: v for k, v in vehicle_regex.items()
-            if not any(
-                v.pattern == ip.pattern or
-                ip.pattern in v.pattern or
-                v.pattern in ip.pattern
-                for ip in ignore_patterns
-            )
-        }
-    return get_filtered_vehicle_patterns._cache
-
-
-async def schedule_weekly_report(stop_event: asyncio.Event):
-    """Планировщик для еженедельной отправки с обработкой остановки"""
-    while not stop_event.is_set():
-        try:
-            now = datetime.now(timezone.utc)
-
-            # Расчёт следующего воскресенья в 20:10 UTC
-            days_ahead = (6 - now.weekday()) % 7
-            next_sunday = now + timedelta(days=days_ahead)
-            target_time = next_sunday.replace(
-                hour=20,
-                minute=10,
-                second=0,
-                tzinfo=timezone.utc
-            )
-
-            if now > target_time:
-                target_time += timedelta(days=7)
-
-            delay = (target_time - now).total_seconds()
-            while delay > 0 and not stop_event.is_set():
-                await asyncio.sleep(min(delay, 300))
-                now = datetime.now(timezone.utc)
-                delay = (target_time - now).total_seconds()
-
-            if stop_event.is_set():
-                break
-
-            logging.info("Начало отправки еженедельных отчетов")
-            await send_weekly_embeds()
-
-        except Exception as e:
-            logging.error(f"Ошибка в планировщике: {str(e)}")
-            await asyncio.sleep(60)
-
-def get_start_of_week(date_str):
-    date = datetime.fromisoformat(date_str)
-    start_of_week = date - timedelta(days=date.weekday())
-    return datetime.combine(start_of_week.date(), datetime.min.time(), tzinfo=timezone.utc)
-
-
-def get_ignored_role_patterns():
-    return tuple(re.compile(pattern, re.IGNORECASE) for pattern in IGNORED_ROLE_PATTERNS)
-
-
-def matches_ignored_role_patterns(text: str) -> bool:
-    """
-    Проверяет, совпадает ли text с любым паттерном из IGNORED_ROLE_PATTERNS.
-    """
-    return any(regex.search(text) for regex in get_ignored_role_patterns())
-
-def process_weapons(weapons):
-    return weapons.items()
-
-def get_match_stat(player, stat_name):
-    return player.get("matches", {}).get(stat_name, 0)
-
-
-async def save_weekly_stats(server):
-    print("Сохранение статистики началось!!!")
-    client = mongo_clients[server["name"]]
-    db = client[server["db_name"]]
-    squadjs = db[server["collection_name"]]
-    weekly_stats_collection = db[server["weekly_stats_collection"]]
-
-    start_of_week = get_start_of_week(datetime.now(timezone.utc).strftime('%Y-%m-%d'))
-    players_stats = await squadjs.find({}).to_list(length=None)
-    bulk_ops = []
-    for player in players_stats:
-        steam_id = player.get("_id")
-        if not steam_id:
-            continue
-
-        weapons = player.get("weapons", {})
-        possess = player.get("possess", {})
-        player_data = {
-            "_id": steam_id,
-            "name": player.get("name", ""),
-            "kd": player.get("kd", 0),
-            "kills": player.get("kills", 0),
-            "winrate": get_match_stat(player, "winrate"),
-            "cmdwinrate": get_match_stat(player, "cmdwinrate"),
-            "revives": player.get("revives", 0),
-            "tech_kills": get_tech_kills(weapons),
-            "mathes": get_match_stat(player, "matches"),
-            "date": start_of_week,
-        }
-        bulk_ops.append(UpdateOne({"_id": steam_id}, {"$set": player_data}, upsert=True))
-    if bulk_ops:
-        await weekly_stats_collection.bulk_write(bulk_ops)
-
-
-async def get_top_10_diff(server, stat_field, start_date, end_date, regex_filter=None):
-    client = mongo_clients[server["name"]]
-    db = client[server["db_name"]]
-    weekly_stats_collection = db[server["weekly_stats_collection"]]
-    pipeline = [
-        {"$match": {"date": {"$gte": start_date, "$lt": end_date}, **(regex_filter if regex_filter else {})}},
-        {"$project": {stat_field: 1, "name": 1}},
-        {"$sort": {stat_field: -1}},
-        {"$limit": 10},
-    ]
-    result = await weekly_stats_collection.aggregate(pipeline).to_list(length=None)
-    print(f"Top 10 results: {result}")
-    return result
-
-
-def compute_diff_weekly(player, weekly):
-    matches_total = get_match_stat(player, "matches")
-    weekly_matches = weekly.get("mathes", 0)
-    matches_diff = matches_total - weekly_matches
-
-
-    def calculate_diff(current, weekly_value):
-        return {"start": weekly_value, "end": current, "diff": current - weekly_value}
-
-    return {
-        "name": player.get("name", "Unknown"),
-        "steam_id": player.get("_id"),
-        "kills_diff": calculate_diff(
-            player.get("kills", 0) - get_tech_kills(player.get("weapons", {})),
-            weekly.get("kills", 0) - weekly.get("tech_kills", 0)
-        ),
-        "death_diff": calculate_diff(player.get("death", 0), weekly.get("death", 0)),
-        "winrate_diff": calculate_diff(get_match_stat(player, "winrate"), weekly.get("winrate", 0)),
-        "cmdwinrate_diff": calculate_diff(get_match_stat(player, "cmdwinrate"), weekly.get("cmdwinrate", 0)),
-        "revives_diff": calculate_diff(player.get("revives", 0), weekly.get("revives", 0)),
-        "tech_kills_diff": calculate_diff(get_tech_kills(player.get("weapons", {})), weekly.get("tech_kills", 0)),
-        "matches_diff": matches_diff,
-        "matches_total": matches_total
-    }
-
-
-async def compute_diff_async(player, weekly):
-    return await compute_diff_async(player, weekly)
-
-
-async def schedule_weekly_tasks(stop_event: asyncio.Event):
-    """Главный планировщик задач с корректной обработкой остановки"""
-    while not stop_event.is_set():
-        try:
-            now = datetime.now(timezone.utc)
-
-            # Расчет следующего воскресенья для сохранения данных (23:20 MSK)
-            days_until_sunday = (6 - now.weekday()) % 7
-            next_sunday = now + timedelta(days=days_until_sunday)
-            save_time = next_sunday.replace(hour=20, minute=20, second=0, tzinfo=timezone.utc)  # 20:20 UTC
-
-            # Расчет времени для отчетов (следующее воскресенье + 7 дней)
-            report_time = (save_time + timedelta(days=7)).replace(hour=20, minute=10, second=0)
-
-            # Ожидание и выполнение задач
-            await execute_task(save_time, stop_event, save_weekly_snapshot)
-            await execute_task(report_time, stop_event, generate_and_send_reports)
-
-            # Проверка остановки каждые 5 минут
-            await asyncio.sleep(300)
-
-        except Exception as e:
-            logging.error(f"Ошибка в планировщике: {str(e)}")
-            await asyncio.sleep(60)
-
-
-async def execute_task(target_time: datetime, stop_event: asyncio.Event, task_func):
-    """Универсальная функция ожидания и выполнения задач"""
-    while not stop_event.is_set():
-        try:
-            now = datetime.now(timezone.utc)
-            if now >= target_time:
-                await task_func()
-                return
-
-            delay = (target_time - now).total_seconds()
-            if delay > 0:
-                await asyncio.sleep(min(delay, 300))  # Максимальное ожидание 5 минут
-        except Exception as e:
-            logging.error(f"Ошибка выполнения задачи: {str(e)}")
-            await asyncio.sleep(60)
-
-async def save_weekly_snapshot():
-    """Оптимизированное сохранение снапшотов с пакетной обработкой"""
-    for server in SERVERS:
-        try:
-            if not (client := mongo_clients.get(server["name"])):
-                logging.warning(f"Пропуск сервера {server['name']}: нет подключения к MongoDB")
-                continue
-
-            db = client[server["db_name"]]
-            players_col = db[server["collection_name"]]
-            weekly_col = db[server["weekly_stats_collection"]]
-
-            # Пакетное обновление данных
-            players = await players_col.find(
-                projection={"_id": 1, "kills": 1, "revives": 1, "weapons": 1, "matches": 1}
-            ).to_list(None)
-
-            bulk_ops = [
-                UpdateOne(
-                    {"_id": player["_id"]},
-                    {"$set": {
-                        "snapshot": {
-                            "kills": player.get("kills", 0),
-                            "revives": player.get("revives", 0),
-                            "tech_kills": get_tech_kills(player.get("weapons", {})),
-                            "matches": (player.get("matches") or {}).get("total", 0),
-                            "timestamp": datetime.now(timezone.utc)
-                        }
-                    }},
-                    upsert=True
-                ) for player in players
-            ]
-
-            if bulk_ops:
-                result = await weekly_col.bulk_write(bulk_ops)
-                logging.info(
-                    f"Снапшот {server['name']} сохранен. "
-                    f"Игроков: {len(bulk_ops)}, "
-                    f"Обновлено: {result.modified_count}, "
-                    f"Создано: {result.upserted_count}"
-                )
-
-        except Exception as e:
-            logging.error(f"Ошибка сохранения снапшота {server['name']}: {str(e)}")
-            continue
-
-
-async def generate_and_send_reports():
-    """Генерирует и отправляет отчеты на основе разницы данных"""
-    try:
-        for server in SERVERS:
-            client = mongo_clients.get(server["name"])
-            if not client:
-                continue
-
-            db = client[server["db_name"]]
-            players_col = db[server["collection_name"]]
-            weekly_col = db[server["weekly_stats_collection"]]
-
-            # Получаем текущие и сохраненные данные
-            current_players = await players_col.find().to_list(length=None)
-            weekly_data = {doc["_id"]: doc for doc in await weekly_col.find().to_list(length=None)}
-
-            # Вычисляем разницу
-            diffs = []
-            for player in current_players:
-                weekly = weekly_data.get(player["_id"], {})
-                diff = compute_diff_weekly(player, weekly.get("snapshot", {}))
-                diffs.append(diff)
-
-            # Создаем эмбеды
-            embeds = []
-            categories = [
-                ("🔫 Топ по убийствам", "kills_diff", 0xFF0000),
-                ("💉 Топ по воскрешениям", "revives_diff", 0x00FF00),
-                ("🛠️ Топ по технике", "tech_kills_diff", 0x0000FF),
-                ("📅 Топ по матчам", "matches_diff", 0x00BFFF)
-            ]
-
-            for title, field, color in categories:
-                embed = discord.Embed(title=f"{title} ({server['name']})", color=color)
-                sorted_players = sorted(
-                    [p for p in diffs if p.get(field, {}).get("diff", 0) > 0],
-                    key=lambda x: x[field]["diff"],
-                    reverse=True
-                )[:10]
-
-                for idx, player in enumerate(sorted_players, 1):
-                    embed.add_field(
-                        name=f"{idx}. {player['name']}",
-                        value=f"+{player[field]['diff']}",
-                        inline=False
-                    )
-
-                if sorted_players:
-                    embeds.append(embed)
-
-            # Отправка в канал
-            if embeds:
-                channel = bot.get_channel(server["weekly_stats_channel"])
-                if channel:
-                    await channel.send(embeds=embeds)
-    except Exception as e:
-        logging.error(f"Ошибка генерации отчета: {str(e)}")
-
-
-async def send_weekly_embeds():
-    """Формирует и отправляет еженедельные эмбеды для всех серверов"""
-    try:
-        for server in SERVERS:
-            try:
-                client = mongo_clients.get(server["name"])
-                if not client:
-                    logging.error(f"MongoDB клиент для сервера {server['name']} не найден")
-                    continue
-
-                db = client[server["db_name"]]
-                weekly_stats_col = db[server["weekly_stats_collection"]]
-
-                # Получаем данные за последние 7 дней
-                start_date = datetime.now(timezone.utc) - timedelta(days=7)
-                stats_data = await weekly_stats_col.find({
-                    "timestamp": {"$gte": start_date},
-                    "server": server["name"]
-                }).to_list(length=None)
-
-                if not stats_data:
-                    logging.warning(f"Нет данных для сервера {server['name']}")
-                    continue
-
-                # Создаем эмбеды для всех критериев
-                embeds = []
-                categories = [
-                    ("🔫 Топ-10 по убийствам", "kills_diff", 0xFF0000),
-                    ("💉 Топ-10 по воскрешениям", "revives_diff", 0x00FF00),
-                    ("🏅 Топ-10 по KD", "kd_diff", 0xFFD700),
-                    ("🎖️ Топ-10 по винрейту", "winrate_diff", 0x9400D3),
-                    ("🛠️ Топ-10 по технике", "tech_kills_diff", 0x0000FF),
-                    ("📅 Топ-10 по матчам", "matches_diff", 0x00BFFF)
-                ]
-
-                for title, field, color in categories:
-                    # Исправлено: добавлена закрывающая скобка для Embed
-                    embed = discord.Embed(
-                        title=f"{title} ({server['name']})",
-                        color=color,
-                        timestamp=datetime.now(timezone.utc)
-                    )
-
-                    # Исправлено: добавлена проверка наличия поля
-                    valid_players = [
-                        p for p in stats_data
-                        if isinstance(p.get(field, 0), (int, float))
-                    ]
-
-                    sorted_data = sorted(
-                        valid_players,
-                        key=lambda x: x.get(field, 0),
-                        reverse=True
-                    )[:10]
-
-                    embed.description = (
-                        f"Статистика за период: "
-                        f"{start_date.strftime('%d.%m.%Y')} - "
-                        f"{datetime.now(timezone.utc).strftime('%d.%m.%Y')}"
-                    )
-
-                    for idx, player in enumerate(sorted_data, 1):
-                        value = player.get(field, 0)
-                        display_value = f"{value:.1f}" if isinstance(value, float) else value
-
-                        embed.add_field(
-                            name=f"{idx}. {player.get('name', 'Unknown')}",
-                            value=str(display_value),
-                            inline=False
-                        )
-
-                    if sorted_data:
-                        embeds.append(embed)
-
-                # Отправка в указанный канал
-                if embeds:
-                    channel = bot.get_channel(WEEKLY_STATS_CHANNEL_ID)
-                    if channel:
-                        await channel.send(embeds=embeds)
-                        logging.info(f"Отчет для {server['name']} отправлен в канал {channel.id}")
-                    else:
-                        logging.error(f"Канал {WEEKLY_STATS_CHANNEL_ID} не найден")
-                else:
-                    logging.warning(f"Нет данных для отправки на сервере {server['name']}")
-
-            except Exception as e:
-                logging.error(f"Ошибка обработки сервера {server['name']}: {str(e)}")
-                continue
-
-    except Exception as e:
-        logging.error(f"Критическая ошибка в send_weekly_embeds: {str(e)}")
-
-
-async def schedule_daily_report(stop_event: asyncio.Event):
-    """Ежедневная отправка статистики в 00:00 MSK (21:00 UTC)"""
-    while not stop_event.is_set():
-        try:
-            now = datetime.now(timezone.utc)
-
-            # Расчет времени следующего выполнения
-            next_run = now.replace(
-                hour=21,  # 21:00 UTC = 00:00 MSK
-                minute=0,
-                second=0,
-                microsecond=0
-            )
-
-            if now >= next_run:
-                next_run += timedelta(days=1)
-
-            delay = (next_run - now).total_seconds()
-            await asyncio.sleep(delay)
-
-            logging.info("Начало отправки ежедневных отчетов")
-            await send_daily_stats()
-
-        except Exception as e:
-            logging.error(f"Ошибка в ежедневном планировщике: {str(e)}")
-            await asyncio.sleep(60)
-
-
-async def send_daily_stats():
-    """Генерация и отправка ежедневной статистики"""
-    try:
-        for server in SERVERS:
-            try:
-                client = mongo_clients.get(server["name"])
-                if not client:
-                    logging.warning(f"Сервер {server['name']}: нет подключения к MongoDB")
-                    continue
-
-                db = client[server["db_name"]]
-                stats_col = db[server["onl_stats_collection_name"]]
-
-                # Изменяем период на 1 день
-                daily_data = await stats_col.aggregate([
-                    {
-                        "$match": {
-                            "timestamp": {
-                                "$gte": datetime.now(timezone.utc) - timedelta(days=1)
-                            }
-                        }
-                    },
-                    {"$sort": {"total_kills": -1}},
-                    {"$limit": 10},
-                    {"$project": {
-                        "_id": 1,
-                        "total_kills": 1,
-                        "total_revives": 1,
-                        "total_tech": 1
-                    }}
-                ]).to_list(None)
-
-                if not daily_data:
-                    continue
-
-                # Меняем заголовок и текст
-                embed = discord.Embed(
-                    title=f"📊 Ежедневная статистика ({server['name']})",
-                    color=0xFFA500,  # Оранжевый цвет
-                    description=f"Данные за {datetime.now(timezone.utc).strftime('%d.%m.%Y')}"
-                )
-
-                kills_values = [
-                    f"{i + 1}. {p['_id']} — {p.get('total_kills', 0)}"
-                    for i, p in enumerate(daily_data)
-                ]
-                embed.add_field(
-                    name="🔫 Топ убийств за день",
-                    value="\n".join(kills_values)[:1024],
-                    inline=False
-                )
-
-                channel = bot.get_channel(DAILY_STATS_CHANNEL_ID)
-                if channel:
-                    await channel.send(embed=embed)
-                    await asyncio.sleep(1)
-
-            except Exception as e:
-                logging.error(f"Ошибка на сервере {server['name']}: {str(e)}")
-                continue
-
-    except Exception as e:
-        logging.error(f"Критическая ошибка: {str(e)}")
 
 def setup_logging():
     """Настройка логирования с цветным выводом в консоль и записью в файл"""
@@ -1836,7 +1167,7 @@ def setup_logging():
         return logger
 
     except Exception as e:
-        logging.error(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", file=sys.stderr)
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", file=sys.stderr)
         raise
 
 
@@ -1869,146 +1200,106 @@ async def verify_log_file(log_path):
         return False
 
 
-async def send_suspect_message(server, name, steam_id, weapon):
-    try:
-        channel = bot.get_channel(server["report_channel_id"])
-        if not channel:
-            return
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-        embed = discord.Embed(
-            title="🚨 Подозрительная активность с огнестрельным оружием",
-            color=0xFF4500,
-            description=(
-                f"**Игрок:** {name}\n"
-                f"**SteamID:** `{steam_id}`\n"
-                f"**Конкретное оружие:** {weapon}\n"
-                f"**Нарушение:** 5+ убийств за 1 секунду"
-            )
-        )
-
-        await channel.send(embed=embed)
-        logging.info(f"Игрок {name} убли 5+ игроков за 2 сек ({steam_id})")
-
-    except Exception as e:
-        logging.error(f"Error sending suspect alert: {str(e)}")
-
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEM")
 
 @bot.event
-async def on_ready() -> None:
-    """Обработчик события успешного запуска бота"""
-    logger.info(f"Бот {bot.user} успешно запущен!")
-    await bot.change_presence(activity=discord.Game(name="Squad Statistics"))
+async def on_ready():
+    """Обработчик события запуска бота"""
+    logging.info(f"Бот готов: {bot.user} (ID: {bot.user.id})")
+    logging.info(f'Доступные серверы: {len(bot.guilds)}')
+    for guild in bot.guilds:
+        logging.info(f'- {guild.name} (ID: {guild.id})')
+    await main()  # Запуск основной логики после подключения бота
 
-    try:
-        # Инициализация подключений к MongoDB
-        for server in SERVERS:
-            try:
-                client = AsyncIOMotorClient(
-                    MONGO_URI,
-                    serverSelectionTimeoutMS=5000,
-                    connectTimeoutMS=10000,
-                    socketTimeoutMS=30000
-                )
-                await client.admin.command('ping')
-                bot.mongo_clients[server["name"]] = client
-                logger.info(f"MongoDB подключен для {server['name']}")
-            except PyMongoError as e:
-                logger.error(f"Ошибка подключения к MongoDB ({server['name']}): {e}")
-                continue
 
-        # Запуск фоновых задач
-        bot._background_tasks.extend([
-            asyncio.create_task(background_stats_updater()),
-            asyncio.create_task(log_watcher()),
-            asyncio.create_task(schedule_weekly_report()),
-            asyncio.create_task(schedule_daily_report())
-        ])
+async def main():
+    """Основная асинхронная логика приложения"""
+    logger = setup_logging()
+    logger.info("Инициализация приложения")
 
-    except Exception as e:
-        logger.critical(f"Критическая ошибка инициализации: {e}")
-        await bot.close()
-
-async def background_stats_updater() -> None:
-    """Фоновая задача для периодического обновления статистики"""
-    while not bot.stop_event.is_set():
-        try:
-            # Логика обновления статистики
-            logger.info("Запуск обновления статистики...")
-            await asyncio.sleep(3600)  # Интервал обновления - 1 час
-        except asyncio.CancelledError:
-            logger.info("Задача обновления статистики отменена")
-            break
-        except Exception as e:
-            logger.error(f"Ошибка в фоновой задаче: {e}")
-            await asyncio.sleep(60)
-
-async def log_watcher() -> None:
-    """Мониторинг лог-файлов серверов"""
+    # Инициализация MongoDB
     for server in SERVERS:
         try:
-            log_path = Path(server["log_file"])
-            if not log_path.parent.exists():
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-
-            observer = Observer()
-            handler = SquadLogHandler(str(log_path), server)
-            observer.schedule(handler, str(log_path.parent))
-
-            thread = threading.Thread(
-                target=observer.start,
-                daemon=True,
-                name=f"LogWatcher-{server['name']}"
+            client = AsyncIOMotorClient(
+                server["mongo_uri"],
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=10000,
+                socketTimeoutMS=30000
             )
-            thread.start()
-            bot.observers.append((observer, thread))
-            logger.info(f"Мониторинг логов запущен для {server['name']}")
-
+            await client.admin.command('ping')
+            mongo_clients[server["name"]] = client
+            logger.info(f"MongoDB подключен: {server['name']}")
         except Exception as e:
-            logger.error(f"Ошибка запуска наблюдателя для {server['name']}: {e}")
+            logger.error(f"Ошибка MongoDB ({server['name']}): {str(e)}")
+            continue
 
-async def schedule_weekly_report() -> None:
-    """Планировщик еженедельных отчетов"""
-    while not bot.stop_event.is_set():
+    # Запуск наблюдателей логов
+    observers = []
+    for server in SERVERS:
         try:
-            # Логика расчета времени и отправки отчетов
-            await asyncio.sleep(3600)  # Временная заглушка
-        except asyncio.CancelledError:
-            logger.info("Еженедельный планировщик отменен")
-            break
-        except Exception as e:
-            logger.error(f"Ошибка в еженедельном планировщике: {e}")
+            if not await verify_log_file(server["logFilePath"]):
+                continue
 
-async def schedule_daily_report() -> None:
-    """Планировщик ежедневных отчетов"""
-    while not bot.stop_event.is_set():
+            handler = SquadLogHandler(server["logFilePath"], server, asyncio.get_running_loop())
+            observer = Observer()
+            observer.schedule(handler, os.path.dirname(server["logFilePath"]))
+
+            observer_thread = threading.Thread(
+                target=observer.start,
+                name=f"Observer-{server['name']}",
+                daemon=True
+            )
+            observer_thread.start()
+            observers.append((observer, observer_thread, handler))
+            logger.info(f"Мониторинг логов запущен: {server['name']}")
+
+        except Exception as e:
+            logger.error(f"Ошибка наблюдателя ({server['name']}): {str(e)}")
+
+    # Инициализация записей матчей
+    for server in SERVERS:
         try:
-            # Логика расчета времени и отправки отчетов
-            await asyncio.sleep(3600)  # Временная заглушка
-        except asyncio.CancelledError:
-            logger.info("Ежедневный планировщик отменен")
-            break
+            await create_initial_match_record(server)
         except Exception as e:
-            logger.error(f"Ошибка в ежедневном планировщике: {e}")
+            logger.error(f"Ошибка инициализации матча: {e}")
 
-def signal_handler(sig: int, frame: any) -> None:
-    """Обработчик системных сигналов"""
-    logger.info(f"Получен сигнал {sig}, инициирую завершение работы...")
-    bot.loop.create_task(bot.shutdown())
 
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
+async def shutdown(observers):
+    """Корректное завершение работы"""
+    logging.info("Завершение работы приложения")
+
+    # Остановка наблюдателей
+    for observer, thread, handler in observers:
+        try:
+            handler.shutdown()
+            observer.stop()
+            thread.join(timeout=5)
+            logging.info(f"Наблюдатель остановлен: {handler.server['name']}")
+        except Exception as e:
+            logging.error(f"Ошибка остановки наблюдателя: {str(e)}")
+
+    # Закрытие подключений MongoDB
+    for name, client in mongo_clients.items():
+        try:
+            client.close()
+            await asyncio.sleep(0.1)
+            logging.info(f"MongoDB отключен: {name}")
+        except Exception as e:
+            logging.error(f"Ошибка закрытия MongoDB: {str(e)}")
+
 
 if __name__ == "__main__":
-    if not DISCORD_TOKEN:
-        logger.critical("Токен Discord не найден в переменных окружения!")
-        sys.exit(1)
-
     try:
-        bot.run(DISCORD_TOKEN)
+        # Используйте токен из переменных окружения
+        DISCORD_TOKEN = DISCORD_TOKEN
+        if not DISCORD_TOKEN:
+            raise ValueError("Токен Discord не найден!")
+
+        bot.run(DISCORD_TOKEN)  # Единственная точка входа для бота
+
     except KeyboardInterrupt:
-        logger.info("Работа приложения прервана пользователем")
+        logging.info("Приложение остановлено пользователем")
     except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}")
+        logging.critical(f"Критическая ошибка: {str(e)}")
         sys.exit(1)
