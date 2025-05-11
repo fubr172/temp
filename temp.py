@@ -1,62 +1,62 @@
-def setup_logging():
-    """Настройка логирования с цветным выводом в консоль и записью в файл"""
-    colorama.init()  # Инициализация colorama для поддержки цветов в Windows
+if __name__ == "__main__":
+    # Получаем абсолютный путь к директории скрипта
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    
+    # Проверка наличия токена
+    if not TOKEN:
+        logger.error("Токен бота не задан! Укажите токен в переменной TOKEN")
+        exit(1)
 
+    # Создаем необходимые директории
+    required_dirs = ["assets", "fonts"]
+    for directory in required_dirs:
+        dir_path = os.path.join(SCRIPT_DIR, directory)
+        try:
+            # Проверяем, не существует ли файл с таким именем
+            if os.path.isfile(dir_path):
+                logger.error(f"Ошибка: {dir_path} существует как файл, а не папка!")
+                os.remove(dir_path)  # Удаляем файл
+                
+            os.makedirs(dir_path, exist_ok=True)
+            logger.info(f"Директория создана: {dir_path}")
+            
+            # Устанавливаем права на запись (для Unix-систем)
+            if os.name != 'nt':  # Если не Windows
+                os.chmod(dir_path, 0o777)
+                
+        except PermissionError:
+            logger.error(f"Нет прав на создание папки: {dir_path}")
+            logger.error("Попробуйте запустить скрипт с правами администратора")
+            exit(1)
+        except Exception as e:
+            logger.error(f"Критическая ошибка при создании {dir_path}: {str(e)}")
+            exit(1)
+
+    # Проверка файлов (после создания папок)
     try:
-        log_dir = Path("logs")
-        log_dir.mkdir(exist_ok=True, mode=0o755)  # Создаем директорию один раз
+        # Проверка шрифта
+        font_path = os.path.join(SCRIPT_DIR, "fonts", "arial.ttf")
+        if not os.path.exists(font_path):
+            logger.error(f"Файл шрифта отсутствует: {font_path}")
+            logger.error("Поместите файл arial.ttf в папку fonts")
+            exit(1)
 
-        # Цвета через colorama для кроссплатформенной поддержки
-        COLORS = {
-            'DEBUG': colorama.Fore.BLUE,
-            'INFO': colorama.Fore.GREEN,
-            'WARNING': colorama.Fore.YELLOW,
-            'ERROR': colorama.Fore.RED,
-            'CRITICAL': colorama.Back.RED + colorama.Fore.WHITE,
-            'RESET': colorama.Style.RESET_ALL
-        }
-
-        class ColorFormatter(logging.Formatter):
-            def format(self, record):
-                color = COLORS.get(record.levelname, COLORS['RESET'])
-                message = super().format(record)
-                return f"{color}{message}{COLORS['RESET']}"
-
-        log_format = "%(asctime)s [%(levelname)-8s] [%(filename)s:%(lineno)d] %(message)s"
-        date_format = "%Y-%m-%d %H:%M:%S"
-
-        # Создаем и настраиваем обработчики
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)  # Уровень для консоли
-        console_handler.setFormatter(ColorFormatter(log_format, date_format))
-
-        file_handler = RotatingFileHandler(
-            filename=log_dir / "application.log",
-            maxBytes=100 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8"
-        )
-        file_handler.setLevel(logging.DEBUG)  # Уровень для файла
-        file_handler.setFormatter(logging.Formatter(log_format, date_format))
-
-        # Настройка корневого логгера
-        logger = logging.getLogger()
-        logger.setLevel(logging.DEBUG)  # Минимальный уровень для обработки
-
-        # Очистка старых обработчиков
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-
-        # Добавляем новые обработчики
-        logger.addHandler(console_handler)
-        logger.addHandler(file_handler)
-
-        # Настройка сторонних логгеров
-        for lib in ['motor', 'pymongo', 'discord']:
-            logging.getLogger(lib).setLevel(logging.WARNING)
-
-        return logger
-
+        # Проверка изображений
+        for img_name, img_path in IMAGE_PATHS.items():
+            full_path = os.path.join(SCRIPT_DIR, img_path)
+            if not os.path.exists(full_path):
+                logger.error(f"Отсутствует изображение: {full_path}")
+                logger.error(f"Необходимо добавить файл: {img_name}")
+                exit(1)
+                
     except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА: {e}", file=sys.stderr)
-        raise
+        logger.error(f"Ошибка проверки файлов: {str(e)}")
+        exit(1)
+
+    # Запуск бота
+    try:
+        bot.run(TOKEN)
+    except discord.LoginError:
+        logger.error("Неверный токен бота!")
+    except Exception as e:
+        logger.error(f"Ошибка при запуске бота: {e}")
