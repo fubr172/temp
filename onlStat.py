@@ -1,4 +1,6 @@
 import asyncio
+from collections import deque, defaultdict
+
 import aiofiles
 import pymongo
 import threading
@@ -11,9 +13,11 @@ import colorama
 
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+
+from discord import embeds
 from motor.motor_asyncio import AsyncIOMotorClient
 from motor.core import AgnosticCollection
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pymongo.errors import PyMongoError
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -58,6 +62,40 @@ REGEX_DISCONNECT = re.compile(
     r"\[\d+\]"
     r"LogNet: UChannel::Close: Sending CloseBunch.*"
     r"UniqueId: RedpointEOS:([a-f0-9]+)"
+)
+
+REGEX_WALLHACK = re.compile(
+    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d+]\[\d+]"
+    r".*?SATAntiCheat:"
+    r"\s+(?P<player>.+?)\s+"
+    r"suspected of cheating:"
+    r"\s+(?P<cheat>WallHack! Keep an eye on him)"
+    r"\.\s+Reported\s+by:\s+(?P<reporter>.+)"
+)
+
+REGEX_INFINITEAMMO = re.compile(
+    r"\["
+    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d+]\[\d+]"
+    r".*?SATAntiCheat:"
+    r"\s+(?P<player>.+?)\s+"
+    r"suspected of cheating:"
+    r"\s+(?P<cheat>"
+    r"InfiniteAmmo\(a\))\s+\.\s+"
+    r" Reported\s+by:\s+(?P<reporter>.+)"
+)
+
+REGEX_VEHICLE = re.compile(
+    r"\["
+    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
+    r"\]\["
+    r"\d+"
+    r"\]"
+    r"LogSquadTrace: \[DedicatedServer\]ASQPlayerController::OnPossess\(\): PC=([^\s]+)"
+    r" \(.*steam: (\d+)\).*Pawn=(BP_[A-Za-z0-9_]+)"
+)
+
+REGEX_KILL = re.compile(
+    r"\[.*\]LogSquad: Player: .*? from ([^\s]+) \(.*steam: (\d+).*?caused by ([^\s]+)"
 )
 
 IGNORED_ROLE_PATTERNS = [
@@ -266,7 +304,11 @@ SERVERS = [
         "collection_name": "Player",
         "onl_stats_collection_name": "onl_stats",
         "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039
+        "discord_channel_id": 1368641402816299039,
+        "discord_wallhack_channel_id": 1371128767790973010,
+        "discord_infiniteammo_channel_id": 1371128863974756482,
+        "vehicle_dis_id": 1371128423073845380,
+        "report_channel_id": 1371129252287742054,
     },
     {
         "name": "ZAVOD2",
@@ -277,7 +319,11 @@ SERVERS = [
         "collection_name": "Player",
         "onl_stats_collection_name": "onl_stats",
         "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039
+        "discord_channel_id": 1368641402816299039,
+        "discord_wallhack_channel_id": 1371128767790973010,
+        "discord_infiniteammo_channel_id": 1371128863974756482,
+        "vehicle_dis_id": 1371128665932300418,
+        "report_channel_id": 1371129252287742054,
     }
 
 ]
@@ -291,7 +337,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 mongo_clients = {}
+infinite_ammo_events = {}
 
+kill_tracker = defaultdict(lambda: defaultdict(deque))
+VEHICLE_EVENT_CACHE = deque(maxlen=100)
+EVENT_COOLDOWN = 300
 
 async def get_match_collection(server):
     """Получает коллекцию matches для указанного сервера, создает если не существует"""
@@ -662,6 +712,126 @@ async def process_log_line(line, server):
             await player_disconnect(server, eos_id)
             logging.debug(f"[{server_name}] Игрок отключился (EOS ID: {eos_id})")
             return
+
+        if match := REGEX_WALLHACK.search(line):
+            player = match.group("player")
+            cheat = match.group("cheat")
+            reporter = match.group("reporter")
+            message = (
+                f"🚨 **Обнаружен читер!**\n"
+                f"На сервере: {server_name['name']}"
+                f"Игрок: `{player}`\n"
+                f"Чит: `{cheat}`\n"
+                f"Сообщил: `{reporter}`"
+            )
+            channel_id = server.get("discord_wallhack_channel_id")
+            if channel_id:
+                channel = bot.get_channel(channel_id)
+                await channel.send(message)
+            return
+
+        # Обработка InfiniteAmmo
+        if match := REGEX_INFINITEAMMO.search(line):
+            current_time = datetime.now(timezone.utc)
+            player = match.group("player")
+            cheat = match.group("cheat")
+            reporter = match.group("reporter")
+
+            # Добавляем событие в историю
+            if server_name not in infinite_ammo_events:
+                infinite_ammo_events[server_name] = []
+            infinite_ammo_events[server_name].append(current_time)
+
+            # Проверяем количество событий за последние 5 секунд
+            time_threshold = current_time - timedelta(seconds=5)
+            recent_events = [
+                t for t in infinite_ammo_events[server_name]
+                if t > time_threshold
+            ]
+            infinite_ammo_events[server_name] = recent_events  # Обновляем список
+
+            if len(recent_events) >= 10:
+                message = (
+                    f"🔥 **Массовое использование InfiniteAmmo!**\n"
+                    f'На сервере: {server_name["name"]}\n'
+                    f"Игрок: `{player}`\n"
+                    f"Чит: `{cheat}`\n"
+                    f"Сообщил: `{reporter}`\n"
+                    f"Событий за 5 сек: `{len(recent_events)}`"
+                )
+                channel_id = server.get("discord_infiniteammo_channel_id")
+                if channel_id:
+                    channel = bot.get_channel(channel_id)
+                    await channel.send(message)
+                infinite_ammo_events[server_name].clear()  # Сброс после уведомления
+
+        if match := REGEX_VEHICLE.search(line):
+            timestamp = datetime.now(timezone.utc).timestamp()
+            player_name = match.group(2)
+            steam_id = match.group(3)
+            vehicle_type = match.group(4)
+
+            event_key = f"{steam_id}-{vehicle_type}-{int(timestamp // EVENT_COOLDOWN)}"
+
+            if event_key in VEHICLE_EVENT_CACHE:
+                logging.debug(f"Дубликат события: {event_key}")
+                return
+
+            VEHICLE_EVENT_CACHE.append(event_key)
+
+            vehicle_name = None
+
+            if vehicle_type in vehicle_mapping:
+                vehicle_name = vehicle_mapping[vehicle_type]
+
+            else:
+                for key, value in vehicle_mapping.items():
+                    if key in vehicle_type:
+                        vehicle_name = value
+                        break
+
+            if vehicle_name:
+                await send_vehicle_message(server, player_name, steam_id, vehicle_name)
+
+            return
+
+        if kill_match := REGEX_KILL.search(line):
+
+            attacker_name = kill_match.group(1)
+            steam_id = kill_match.group(2)
+            weapon = kill_match.group(3)
+            current_time = datetime.now(timezone.utc)
+
+            # Проверяем оружие по паттернам
+            is_rifle = False
+            for weapon_pattern in RIFLE_WEAPONS.values():
+                if weapon_pattern.fullmatch(weapon):
+                    is_rifle = True
+                    break
+                elif weapon_pattern.search(weapon):
+                    is_rifle = True
+                    break
+
+            if not is_rifle:
+                return
+
+            # Обновляем статистику только для винтовок
+            times = kill_tracker[steam_id]['rifle_kills']
+            times.append(current_time)
+
+            # Очищаем старые записи
+            while times and (current_time - times[0]) > timedelta(seconds=2):
+                times.popleft()
+
+            if len(times) >= 5:
+                await send_suspect_message(
+                    server,
+                    attacker_name,
+                    steam_id,
+                    "Rifle weapon",
+                    weapon
+                )
+                times.clear()
 
     except ValueError as ve:
         logging.error(f"[{server_name}] Ошибка валидации: {ve}")
@@ -1073,6 +1243,65 @@ def get_tech_kills(weapons):
         any(pattern.search(weapon) for pattern in FILTERED_VEHICLE_PATTERNS.values())
     )
 
+async def send_vehicle_message(server, player_name, steam_id, vehicle_name):
+    try:
+        if not player_name:
+            player_name = "Неизвестный игрок"
+
+        if not steam_id.isdigit():
+            logging.error(f"Некорректный SteamID: {steam_id}")
+            return
+
+        channel_id = server.get('vehicle_dis_id')
+        if not channel_id:
+            logging.error(f"Канал не найден в конфигурации сервера {server["name"]}")
+            return
+
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            logging.error(f"Дискорд канал не найден {channel_id}")
+            return
+
+        embed = discord.Embed(
+            title="Клейм техники",
+            color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        embed.add_field(name="Игрок", value=player_name, inline=True)
+        embed.add_field(name="SteamID", value=f"`{steam_id}`", inline=True)
+        embed.add_field(name="Техника", value=vehicle_name, inline=False)
+
+        for embed in embeds:
+            await channel.send(embed=embed)
+            await asyncio.sleep(1)
+            logging.info(f'Сообщение о транспорте отправлено для {player_name} ({steam_id})')
+
+    except Exception as e:
+        logging.error(f"Ошибка отправки сообщения (о клейме техники): {str(e)}")
+
+async def send_suspect_message(server, name, steam_id, weapon):
+    try:
+        channel = bot.get_channel(server["report_channel_id"])
+        if not channel:
+            return
+
+        embed = discord.Embed(
+            title="🚨 Подозрительная активность с огнестрельным оружием",
+            color=0xFF4500,
+            description=(
+                f"На сервере: {server['name']}\n"
+                f"**Игрок:** {name}\n"
+                f"**SteamID:** `{steam_id}`\n"
+                f"**Конкретное оружие:** {weapon}\n"
+                f"**Нарушение:** 5+ убийств за 1 секунду"
+            )
+        )
+
+        await channel.send(embed=embed)
+        logging.info(f"Игрок {name} убли 5+ игроков за 2 сек ({steam_id})")
+
+    except Exception as e:
+        logging.error(f"Error sending suspect alert: {str(e)}")
 
 def setup_logging():
     """Настройка логирования с цветным выводом в консоль и записью в файл"""
