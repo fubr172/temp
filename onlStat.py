@@ -24,6 +24,8 @@ from watchdog.events import FileSystemEventHandler
 from discord.ext import commands
 from pymongo import UpdateOne
 
+DISCORD_TOKEN = 
+
 REGEX_MATCH_START = re.compile(
     r"\["
     r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}"
@@ -621,7 +623,7 @@ async def end_match(server):
 
         if match["_id"] not in end_match.processed:
             end_match.processed.add(match["_id"])
-            asyncio.get_event_loop().call_later(300, end_match.processed.remove, match["_id"])  # Забыть через 5 минут
+            asyncio.get_event_loop().call_later(100, end_match.processed.remove, match["_id"])  # Забыть через 5 минут
 
         return True
 
@@ -899,7 +901,7 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
 
 
 async def remove_disconnected_players(server):
-    """Удаляет статистику отключившихся игроков по EOS ID."""
+    """Удаляет статистику отключившихся игроков по EOS ID и очищает players в matches."""
     try:
         server_name = server["name"]
         client = mongo_clients.get(server_name)
@@ -937,7 +939,6 @@ async def remove_disconnected_players(server):
                 {"_id": {"$in": steam_ids_without_eos}},
                 {"_id": 1, "eosid": 1}
             ).to_list(length=None)
-
             resolved_eos = [p["eosid"] for p in players_data if "eosid" in p]
 
         # 4. Объединить EOS из disconnected_eos и resolved_eos
@@ -945,14 +946,27 @@ async def remove_disconnected_players(server):
 
         # 5. Удалить записи из onl_stats по EOS
         if all_eos_to_remove:
-            result = await onl_stats_col.delete_many(
-                {"eos": {"$in": all_eos_to_remove}}
-            )
-            logging.info(
-                f"[{server_name}] Removed {result.deleted_count} players from onl_stats."
-            )
+            result = await onl_stats_col.delete_many({"eos": {"$in": all_eos_to_remove}})
+            logging.info(f"[{server_name}] Removed {result.deleted_count} players from onl_stats.")
 
-        # 6. Очистить disconnected_players в матче
+        # 6. Удалить игроков из массива players в matches, используя EOS и SteamID
+        players_to_remove = []
+        for player in players_in_match:
+            # Проверяем EOS ID игрока
+            if player.get("eos_id") in all_eos_to_remove:
+                players_to_remove.append(player["steam_id"])
+            # Проверяем Steam ID для игроков без EOS
+            elif player["steam_id"] in steam_ids_without_eos:
+                players_to_remove.append(player["steam_id"])
+
+        if players_to_remove:
+            await matches_col.update_one(
+                {"_id": match["_id"]},
+                {"$pull": {"players": {"steam_id": {"$in": players_to_remove}}}
+            )
+            logging.info(f"[{server_name}] Removed {len(players_to_remove)} players from matches.players")
+
+        # 7. Очистить disconnected_players
         await matches_col.update_one(
             {"_id": match["_id"]},
             {"$set": {"disconnected_players": []}}
@@ -1023,6 +1037,8 @@ async def calculate_final_stats(server: dict) -> None:
         await send_discord_report(diffs, server)
         await asyncio.sleep(3)
         await update_onl_stats(diffs, server)
+        await asyncio.sleep(5)
+        await remove_disconnected_players(server)
 
         logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
@@ -1193,8 +1209,7 @@ async def update_onl_stats(players, server):
 
         await asyncio.gather(*(update_player(player) for player in players))
 
-        await asyncio.sleep(5)
-        await remove_disconnected_players(server)
+
 
     except Exception as e:
         logging.error(f"[{server['name']}] Ошибка обновления статистики: {str(e)}")
@@ -1494,4 +1509,3 @@ if __name__ == "__main__":
     except Exception as e:
         logging.critical(f"Критическая ошибка: {str(e)}")
         sys.exit(1)
-
