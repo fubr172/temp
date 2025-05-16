@@ -24,7 +24,6 @@ from watchdog.events import FileSystemEventHandler
 from discord.ext import commands
 from pymongo import UpdateOne
 
-DISCORD_TOKEN = 
 
 REGEX_MATCH_START = re.compile(
     r"\["
@@ -854,6 +853,90 @@ async def process_log_line(line, server):
         logging.error(f"[{server_name}] Неожиданная ошибка при обработке строки: {e}")
 
 
+async def update_onl_stats(server):
+    """Обновляет статистику в onl_stats с использованием save_initial_stats"""
+    logging.info(f"[{server['name']}] Начало обновления статистики")
+    try:
+        client = mongo_clients.get(server["name"])
+        if not client:
+            logging.error(f"MongoDB клиент недоступен для {server['name']}")
+            return
+
+        db = client[server["db_name"]]
+        matches_col = db[server["matches_collection_name"]]
+        players_col = db[server["collection_name"]]
+        onl_stats_col = db[server["onl_stats_collection_name"]]
+
+        # Получаем последний матч
+        match = await matches_col.find_one(
+            {"server_name": server["name"]},
+            sort=[("end_time", -1)]
+        )
+
+        if not match:
+            logging.warning(f"Нет данных матча для {server['name']}")
+            return
+
+        # Извлекаем steam_id всех участников матча
+        steam_ids = [p["steam_id"] for p in match.get("players", [])]
+
+        if not steam_ids:
+            logging.info(f"Нет игроков в матче {server['name']}")
+            return
+
+        # Этап 1: Сохраняем начальную статистику для всех игроков
+        logging.info("Сохранение начальной статистики...")
+        initial_stats_tasks = []
+        for steam_id in steam_ids:
+            # Получаем EOS ID из коллекции Player
+            player_data = await players_col.find_one(
+                {"_id": steam_id},
+                {"eosid": 1}
+            )
+            eos_id = player_data.get("eosid") if player_data else None
+
+            # Создаем задачу для сохранения начальных данных
+            initial_stats_tasks.append(
+                save_initial_stats(server, steam_id, eos_id)
+            )
+
+        # Параллельное выполнение всех задач
+        await asyncio.gather(*initial_stats_tasks)
+
+        # Этап 2: Переносим актуальные данные из Player
+        logging.info("Перенос актуальной статистики...")
+        bulk_ops = []
+        now = datetime.now(timezone.utc)
+
+        players_data = await players_col.find(
+            {"_id": {"$in": steam_ids}},
+            {"_id": 1, "kills": 1, "revives": 1, "weapons": 1, "name": 1}
+        ).to_list(length=None)
+
+        for player in players_data:
+            bulk_ops.append(
+                UpdateOne(
+                    {"_id": player["_id"]},
+                    {"$set": {
+                        "kills": player.get("kills", 0),
+                        "revives": player.get("revives", 0),
+                        "tech_kills": get_tech_kills(player.get("weapons", {})),
+                        "name": player.get("name", ""),
+                        "server": server["name"],
+                        "last_updated": now
+                    }},
+                    upsert=False  # Только обновление, так как создание уже выполнено
+                )
+            )
+
+        if bulk_ops:
+            await onl_stats_col.bulk_write(bulk_ops, ordered=False)
+            logging.info(f"Обновлено {len(bulk_ops)} записей в onl_stats")
+
+    except Exception as e:
+        logging.error(f"Ошибка обновления данных: {str(e)}")
+        raise
+
 async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) -> bool:
     try:
         if not (client := mongo_clients.get(server["name"])):
@@ -901,12 +984,12 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
 
 
 async def remove_disconnected_players(server):
-    """Удаляет статистику отключившихся игроков по EOS ID и очищает players в matches."""
+    """Удаляет статистику по SteamID и игроков по EOSID с проверкой через Player"""
     try:
         server_name = server["name"]
         client = mongo_clients.get(server_name)
         if not client:
-            logging.error(f"MongoDB client not found for server: {server_name}")
+            logging.error(f"MongoDB client not found: {server_name}")
             return
 
         db = client[server["db_name"]]
@@ -920,60 +1003,66 @@ async def remove_disconnected_players(server):
             projection={"disconnected_players": 1, "players": 1}
         )
         if not match:
-            logging.warning(f"No active match found for server: {server_name}")
+            logging.warning(f"No active match: {server_name}")
             return
 
-        disconnected_eos = match.get("disconnected_players", [])
-        players_in_match = match.get("players", [])
+        # 2. Получить EOSID для удаления
+        eos_to_process = match.get("disconnected_players", []).copy()
+        all_steam_ids_to_remove = set()
 
-        # 2. Собрать SteamID игроков без EOS из players_in_match
-        steam_ids_without_eos = [
-            p["steam_id"] for p in players_in_match
-            if "eos_id" not in p or not p["eos_id"]
-        ]
-
-        # 3. Найти EOS для SteamID из коллекции Player
-        resolved_eos = []
-        if steam_ids_without_eos:
-            players_data = await players_col.find(
-                {"_id": {"$in": steam_ids_without_eos}},
-                {"_id": 1, "eosid": 1}
-            ).to_list(length=None)
-            resolved_eos = [p["eosid"] for p in players_data if "eosid" in p]
-
-        # 4. Объединить EOS из disconnected_eos и resolved_eos
-        all_eos_to_remove = list(set(disconnected_eos + resolved_eos))
-
-        # 5. Удалить записи из onl_stats по EOS
-        if all_eos_to_remove:
-            result = await onl_stats_col.delete_many({"eos": {"$in": all_eos_to_remove}})
-            logging.info(f"[{server_name}] Removed {result.deleted_count} players from onl_stats.")
-
-        # 6. Удалить игроков из массива players в matches, используя EOS и SteamID
-        players_to_remove = []
-        for player in players_in_match:
-            # Проверяем EOS ID игрока
-            if player.get("eos_id") in all_eos_to_remove:
-                players_to_remove.append(player["steam_id"])
-            # Проверяем Steam ID для игроков без EOS
-            elif player["steam_id"] in steam_ids_without_eos:
-                players_to_remove.append(player["steam_id"])
-
-        if players_to_remove:
-            await matches_col.update_one(
-                {"_id": match["_id"]},
-                {"$pull": {"players": {"steam_id": {"$in": players_to_remove}}}
+        # 3. Удаление по EOSID из players
+        if eos_to_process:
+            # Найти записи в players с этими EOSID
+            players_to_delete = await matches_col.find_one(
+                {"_id": match["_id"], "players.eos_id": {"$in": eos_to_process}},
+                {"players.$": 1}
             )
-            logging.info(f"[{server_name}] Removed {len(players_to_remove)} players from matches.players")
 
-        # 7. Очистить disconnected_players
-        await matches_col.update_one(
-            {"_id": match["_id"]},
-            {"$set": {"disconnected_players": []}}
-        )
+            if players_to_delete:
+                # Собрать SteamID для удаления из onl_stats
+                steam_ids_from_eos = [p["steam_id"] for p in players_to_delete.get("players", [])]
+
+                # Удалить из players
+                await matches_col.update_one(
+                    {"_id": match["_id"]},
+                    {"$pull": {"players": {"eos_id": {"$in": eos_to_process}}}}
+                )
+
+                # Добавить SteamID для удаления из onl_stats
+                all_steam_ids_to_remove.update(steam_ids_from_eos)
+
+                # Убрать обработанные EOSID
+                eos_to_process = [eos for eos in eos_to_process
+                                  if eos not in {p["eos_id"] for p in players_to_delete.get("players", [])}]
+
+                # 4. Обработка оставшихся EOSID через коллекцию Player
+                if eos_to_process:
+                # Найти SteamID по EOSID в Player
+                    players_data = await players_col.find(
+                        {"eosid": {"$in": eos_to_process}},
+                        {"_id": 1, "eosid": 1}
+                    ).to_list(length=None)
+
+                # Собрать найденные SteamID
+                additional_steam_ids = [p["_id"] for p in players_data]
+
+                # Удалить записи из players по SteamID
+                if additional_steam_ids:
+                    await matches_col.update_one(
+                        {"_id": match["_id"]},
+                        {"$pull": {"players": {"steam_id": {"$in": additional_steam_ids}}}}
+                    )
+
+                # Добавить к общему списку для удаления из onl_stats
+                all_steam_ids_to_remove.update(additional_steam_ids)
+
+                # 5. Удалить из onl_stats по SteamID
+                if all_steam_ids_to_remove:
+                    await onl_stats_col.delete_many({"_id": {"$in": list(all_steam_ids_to_remove)}})
+                logging.info(f"[{server_name}] Удалено из onl_stats: {len(all_steam_ids_to_remove)}")
 
     except Exception as e:
-        logging.error(f"Error in remove_disconnected_players: {str(e)}")
+        logging.error(f"Ошибка в remove_disconnected_players: {str(e)}")
 
 
 async def calculate_final_stats(server: dict) -> None:
@@ -1036,7 +1125,7 @@ async def calculate_final_stats(server: dict) -> None:
 
         await send_discord_report(diffs, server)
         await asyncio.sleep(3)
-        await update_onl_stats(diffs, server)
+        await update_onl_stats(server)
         await asyncio.sleep(5)
         await remove_disconnected_players(server)
 
@@ -1154,65 +1243,6 @@ async def send_discord_report(diffs, server):
     except Exception as e:
         logging.error(f"Ошибка в sen_discord: {str(e)}")
         raise
-
-
-async def update_onl_stats(players, server):
-    """Обновляет статистику в коллекции onl_stats текущими значениями"""
-    logging.info(f"[{server['name']}] Начинается обновление статистики игроков")
-    try:
-        if not players:
-            logging.info(f"[{server['name']}] Нет данных игроков для обновления")
-            return
-
-        server_name = server["name"]
-        logging.info(f'{server_name} расчет статы')
-
-        if not server_name:
-            logging.error("Не указано имя сервера в конфигурации")
-            return
-
-        if not (client := mongo_clients.get(server_name)):
-            logging.error(f"[{server_name}] MongoDB клиент недоступен")
-            return
-
-        db = client[server["db_name"]]
-        onl_stats_col = db[server["onl_stats_collection_name"]]
-        now = datetime.now(timezone.utc)
-
-        async def update_player(player):
-            pid = player.get("_id")
-            if not pid:
-                logging.error(f"[{server_name}] Игрок без _id пропущен")
-                return
-
-            update_data = {
-                "kills": player.get("kills", 0),
-                "revives": player.get("revives", 0),
-                "tech_kills": get_tech_kills(player.get("weapons", {})),
-                "last_updated": now,
-                "server": server_name
-            }
-
-            if "name" in player:
-                update_data["name"] = player["name"]
-
-            try:
-                result = await onl_stats_col.update_one(
-                    {"_id": pid},
-                    {"$set": update_data},
-                    upsert=True
-                )
-                logging.debug(
-                    f"[{server_name}] Обновлён {pid}, modified={result.modified_count}, upserted_id={result.upserted_id}")
-            except Exception as e:
-                logging.error(f"[{server_name}] Ошибка при обновлении игрока {pid}: {e}")
-
-        await asyncio.gather(*(update_player(player) for player in players))
-
-
-
-    except Exception as e:
-        logging.error(f"[{server['name']}] Ошибка обновления статистики: {str(e)}")
 
 
 COMPILED_IGNORED_ROLE_PATTERNS = tuple(re.compile(pat, re.IGNORECASE) for pat in IGNORED_ROLE_PATTERNS)
