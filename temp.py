@@ -1,84 +1,90 @@
-async def vip_check_impl():
-    """Проверяет VIP-статус."""
-    logging.info("Начинаем проверку VIP-статуса...")
+YOUR_CHANNEL_ID = 1376903047556497528
+# Добавить новую команду и View для кнопки
+@bot.tree.command(name="vip_button", description="Получения VIP на 3 дня")
+@app_commands.describe(steam_id="Steam ID игрока")
+@command_logger_decorator
+async def create_vip_button(interaction: discord.Interaction, steam_id: str):
+    # Проверка канала (замените YOUR_CHANNEL_ID на ID нужного канала)
+    if interaction.channel_id != YOUR_CHANNEL_ID:
+        await interaction.response.send_message("❌ Эту команду можно использовать только в специальном канале!",
+                                                ephemeral=True)
+        return
 
-    try:
-        # Обработка SteamID
-        all_steam_lines = []
-        for file_path in VM_FILE_PATHS:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    all_steam_lines.extend([line.strip() for line in lines])
-                logging.info(f"Загружено {len(lines)} строк из Steam файла {file_path}")
-            except Exception as e:
-                logging.error(f"Ошибка при чтении Steam файла {file_path}: {e}")
-                continue
+    # Проверка формата SteamID
+    if not re.match(STEAMID64_REGEX, steam_id):
+        await interaction.response.send_message("❌ Неверный формат SteamID!", ephemeral=True)
+        return
 
-        # Удаление дубликатов и обработка SteamID
-        unique_steam_lines = list(set(all_steam_lines))
-        valid_steam_lines, expired_steam = process_lines(unique_steam_lines, ENTRY_REGEX)
+    # Создаем сообщение с кнопкой
+    view = discord.ui.View(timeout=None)
+    button = OneTimeVIPButton(steam_id=steam_id)
+    view.add_item(button)
 
-        # Обработка EOSID
-        all_eos_lines = []
-        for file_path in PLAYER_PREFIXES_PATH:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                    all_eos_lines.extend([line.strip() for line in lines])
-                logging.info(f"Загружено {len(lines)} строк из EOS файла {file_path}")
-            except Exception as e:
-                logging.error(f"Ошибка при чтении EOS файла {file_path}: {e}")
-                continue
-
-        # Удаление дубликатов и обработка EOSID
-        unique_eos_lines = list(set(all_eos_lines))
-        valid_eos_lines, expired_eos = process_lines(unique_eos_lines, ENTRY_REGEX_EOS)
-
-        # Сохранение обновленных данных
-        for file_path in VM_FILE_PATHS:
-            save_updated_data(file_path, valid_steam_lines)
-
-        for file_path in PLAYER_PREFIXES_PATH:
-            save_updated_data(file_path, valid_eos_lines)
-
-        logging.info("Проверка VIP/EOS статусов завершена")
-
-    except Exception as e:
-        logging.error(f"Ошибка при обновлении VIP: {e}")
+    await interaction.response.send_message(
+        f"🎮 Нажмите кнопку, чтобы получить VIP на 3 дня для SteamID: `{steam_id}`",
+        view=view
+    )
 
 
-def process_lines(lines, regex_pattern):
-    """Обрабатывает строки, возвращает валидные и истекшие записи."""
-    valid = []
-    expired = []
-    moscow_tz = pytz.timezone("Europe/Moscow")
-    now = datetime.now(moscow_tz).replace(tzinfo=None)
+# Класс для одноразовой кнопки VIP
+class OneTimeVIPButton(discord.ui.Button):
+    def __init__(self, steam_id: str):
+        super().__init__(
+            style=discord.ButtonStyle.blurple,
+            label="Получить VIP на 3 дня",
+            custom_id=f"vip_button_{steam_id}"
+        )
+        self.steam_id = steam_id
+        self.clicked_users = set()
 
-    for line in lines:
-        match = re.match(regex_pattern, line)
-        if not match:
-            valid.append(line)
-            continue
+    async def callback(self, interaction: discord.Interaction):
+        # Проверка на повторное нажатие
+        if interaction.user.id in self.clicked_users:
+            await interaction.response.send_message("❌ Вы уже активировали VIP!", ephemeral=True)
+            return
+        self.clicked_users.add(interaction.user.id)
 
-        date_str = match.group(2)
+        # Выдача VIP
         try:
-            end_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            if end_date > now.date():
-                valid.append(line)
-            else:
-                expired.append(match.group(1))
-        except ValueError:
-            valid.append(line)
+            # Логика выдачи VIP (адаптировано из команды add_vip)
+            days = 3
+            end_date = datetime.now() + timedelta(days=days)
 
-    return valid, expired
+            # Обновление данных для Steam
+            vip_data_steam = []
+            for file_path in VM_FILE_PATHS:
+                vip_data = load_vip_data(file_path)
+                vip_data_steam.extend(vip_data)
 
+            updated = False
+            for i, entry in enumerate(vip_data_steam):
+                match = re.match(ENTRY_REGEX, entry)
+                if match and match.group(1) == self.steam_id:
+                    vip_data_steam[i] = f"Admin={self.steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}"
+                    updated = True
+                    break
 
-def save_updated_data(file_path, lines):
-    """Сохраняет обновленные данные в файл."""
-    try:
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines) + '\n')
-        logging.info(f"Файл {file_path} успешно обновлен")
-    except Exception as e:
-        logging.error(f"Ошибка записи в {file_path}: {e}")
+            if not updated:
+                vip_data_steam.append(f"Admin={self.steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}")
+
+            # Сохранение во всех файлах
+            for file_path in VM_FILE_PATHS:
+                save_vip_data(vip_data_steam, file_path)
+
+            # Делаем кнопку неактивной
+            self.disabled = True
+            await interaction.response.edit_message(view=self.view)
+
+            await interaction.followup.send(
+                f"✅ VIP на 3 дня выдан для SteamID: `{self.steam_id}`",
+                ephemeral=True
+            )
+
+            # Логирование
+            command_logger.info(
+                f"Пользователь {interaction.user.name} активировал VIP для {self.steam_id}"
+            )
+
+        except Exception as e:
+            logging.error(f"Ошибка выдачи VIP: {e}")
+            await interaction.response.send_message("❌ Произошла ошибка!", ephemeral=True)
