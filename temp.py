@@ -1,90 +1,136 @@
-YOUR_CHANNEL_ID = 1376903047556497528
-# Добавить новую команду и View для кнопки
-@bot.tree.command(name="vip_button", description="Получения VIP на 3 дня")
-@app_commands.describe(steam_id="Steam ID игрока")
 @command_logger_decorator
-async def create_vip_button(interaction: discord.Interaction, steam_id: str):
-    # Проверка канала (замените YOUR_CHANNEL_ID на ID нужного канала)
-    if interaction.channel_id != YOUR_CHANNEL_ID:
-        await interaction.response.send_message("❌ Эту команду можно использовать только в специальном канале!",
-                                                ephemeral=True)
-        return
+@bot.tree.command(name="add_vip", description="Добавить VIP статус")
+@app_commands.describe(days="Количество дней VIP", steam_id="Steam ID игрока")
+async def add_vip(interaction: discord.Interaction, days: int, steam_id: str):
+    for file_path in VM_FILE_PATHS + PLAYER_PREFIXES_PATH:
+        logging.info(f"Вызов функции create_config_backup")
+        create_config_backup(file_path)
 
-    # Проверка формата SteamID
-    if not re.match(STEAMID64_REGEX, steam_id):
-        await interaction.response.send_message("❌ Неверный формат SteamID!", ephemeral=True)
-        return
-
-    # Создаем сообщение с кнопкой
-    view = discord.ui.View(timeout=None)
-    button = OneTimeVIPButton(steam_id=steam_id)
-    view.add_item(button)
-
-    await interaction.response.send_message(
-        f"🎮 Нажмите кнопку, чтобы получить VIP на 3 дня для SteamID: `{steam_id}`",
-        view=view
+    user = interaction.user
+    command_logger.info(
+        f"Команда 'add_vip' вызвана пользователем {user.name} "
+        f"с параметрами: дни {days}, SteamID {steam_id}."
     )
 
+    await interaction.response.defer(ephemeral=True)
 
-# Класс для одноразовой кнопки VIP
-class OneTimeVIPButton(discord.ui.Button):
-    def __init__(self, steam_id: str):
-        super().__init__(
-            style=discord.ButtonStyle.blurple,
-            label="Получить VIP на 3 дня",
-            custom_id=f"vip_button_{steam_id}"
+    if interaction.channel_id != ADM_ADD_VIP:
+        command_logger.info(
+            f"Пользователь {user.name} пытался использовать команду не в нужном канале.")
+        return await interaction.followup.send(
+            f"❌ Эту команду можно использовать только в канале <#{ADM_ADD_VIP}>!",
+            ephemeral=True
         )
-        self.steam_id = steam_id
-        self.clicked_users = set()
 
-    async def callback(self, interaction: discord.Interaction):
-        # Проверка на повторное нажатие
-        if interaction.user.id in self.clicked_users:
-            await interaction.response.send_message("❌ Вы уже активировали VIP!", ephemeral=True)
-            return
-        self.clicked_users.add(interaction.user.id)
+    if not re.match(STEAMID64_REGEX, steam_id):
+        command_logger.info(f"Пользователь {user.name} ввёл неверный формат SteamID: {steam_id}.")
+        await interaction.followup.send(
+            "❌ Неверный формат SteamID! Используйте SteamID64 (17 цифр)",
+            ephemeral=True
+        )
+        return
 
-        # Выдача VIP
-        try:
-            # Логика выдачи VIP (адаптировано из команды add_vip)
-            days = 3
-            end_date = datetime.now() + timedelta(days=days)
+    # НОВАЯ ПРОВЕРКА НА КОЛИЧЕСТВО ДНЕЙ
+    if days < 1:
+        command_logger.info(f"Пользователь {user.name} ввёл некорректное количество дней: {days}.")
+        await interaction.followup.send(
+            f"❌ Минимальное количество дней: 1",
+            ephemeral=True
+        )
+        return
 
-            # Обновление данных для Steam
-            vip_data_steam = []
-            for file_path in VM_FILE_PATHS:
-                vip_data = load_vip_data(file_path)
-                vip_data_steam.extend(vip_data)
-
-            updated = False
-            for i, entry in enumerate(vip_data_steam):
-                match = re.match(ENTRY_REGEX, entry)
-                if match and match.group(1) == self.steam_id:
-                    vip_data_steam[i] = f"Admin={self.steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}"
-                    updated = True
-                    break
-
-            if not updated:
-                vip_data_steam.append(f"Admin={self.steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}")
-
-            # Сохранение во всех файлах
-            for file_path in VM_FILE_PATHS:
-                save_vip_data(vip_data_steam, file_path)
-
-            # Делаем кнопку неактивной
-            self.disabled = True
-            await interaction.response.edit_message(view=self.view)
-
-            await interaction.followup.send(
-                f"✅ VIP на 3 дня выдан для SteamID: `{self.steam_id}`",
+    try:
+        user_data = users.find_one({"steam_id": steam_id})
+        if not user_data:
+            return await interaction.followup.send(
+                "❌ Пользователь с таким SteamID не найден в базе данных",
                 ephemeral=True
             )
 
-            # Логирование
-            command_logger.info(
-                f"Пользователь {interaction.user.name} активировал VIP для {self.steam_id}"
+        discord_id = user_data.get('discord_id')
+        if not discord_id:
+            return await interaction.followup.send(
+                "❌ У этого пользователя не привязан Discord аккаунт",
+                ephemeral=True
             )
 
-        except Exception as e:
-            logging.error(f"Ошибка выдачи VIP: {e}")
-            await interaction.response.send_message("❌ Произошла ошибка!", ephemeral=True)
+        eos_id = get_eos_id_from_mongo(steam_id)
+
+        # УПРОЩЕННЫЙ РАСЧЕТ ДАТЫ ОКОНЧАНИЯ
+        end_date = datetime.now() + timedelta(days=days)
+        new_entry_eos = f"{eos_id} = VIP // {end_date.strftime('%Y-%m-%d')}"
+
+        vip_data_steam = []
+        for file_path in VM_FILE_PATHS:
+            vip_data_steam.extend(load_vip_data(file_path))
+
+        updated_steam = False
+        for i, entry in enumerate(vip_data_steam):
+            match = re.match(ENTRY_REGEX, entry)
+            if match and match.group(1) == steam_id:
+                vip_data_steam[i] = f"Admin={steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}"
+                updated_steam = True
+                break
+
+        if not updated_steam:
+            vip_data_steam.append(f"Admin={steam_id}:VIP // {end_date.strftime('%Y-%m-%d')}")
+
+        vip_data_eos = []
+        for file_path in PLAYER_PREFIXES_PATH:
+            vip_data_eos.extend(load_vip_data(file_path))
+
+        updated_eos = False
+        for i, entry in enumerate(vip_data_eos):
+            match = re.match(ENTRY_REGEX_EOS, entry)
+            if match and match.group(1) == eos_id:
+                vip_data_eos[i] = new_entry_eos
+                updated_eos = True
+                break
+
+        if not updated_eos:
+            vip_data_eos.append(new_entry_eos)
+
+        for file_path in VM_FILE_PATHS:
+            save_vip_data(vip_data_steam, file_path)
+
+        for file_path in PLAYER_PREFIXES_PATH:
+            save_vip_data(vip_data_eos, file_path)
+
+        guild = interaction.guild
+        vip_role = discord.utils.get(guild.roles, name=VIP_ROLE)
+        if not vip_role:
+            return await interaction.followup.send(
+                f"❌ Роль '{VIP_ROLE}' не найдена на сервере!",
+                ephemeral=True
+            )
+
+        member = guild.get_member(int(discord_id))
+        role_message = ""
+        if member:
+            try:
+                await member.add_roles(vip_role)
+                role_message = f"✅ Роль {VIP_ROLE} выдана пользователю {member.display_name}"
+            except discord.Forbidden:
+                role_message = "⚠ Не удалось выдать роль (недостаточно прав)"
+            except discord.HTTPException as e:
+                role_message = f"⚠ Ошибка при выдаче роли: {str(e)}"
+        else:
+            role_message = "⚠ Пользователь не найден на сервере"
+
+        # ОБНОВЛЕННОЕ СООБЩЕНИЕ С УКАЗАНИЕМ ДНЕЙ
+        command_logger.info(f"VIP статус для SteamID {steam_id} добавлен на {days} дней.")
+        await interaction.followup.send(
+            f"✅ Добавлен VIP для SteamID `{steam_id}`\n"
+            f"Количество дней: {days}\n"
+            f"Дата окончания: {end_date.strftime('%d.%m.%Y')}\n"
+            f"{role_message}",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        logging.exception(f"Ошибка при выполнении команды add_vip: {e}")
+        command_logger.error(f"Ошибка при выполнении команды add_vip: {str(e)}")
+        await interaction.followup.send(
+            f"⛔ Ошибка: {str(e)}",
+            ephemeral=True
+        )
