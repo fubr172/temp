@@ -1,334 +1,3 @@
-import asyncio
-from collections import deque, defaultdict
-
-import aiofiles
-import pymongo
-import threading
-import logging
-import re
-import os
-import discord
-import sys
-import colorama
-
-from pathlib import Path
-from logging.handlers import RotatingFileHandler
-
-from discord import embeds
-from motor.motor_asyncio import AsyncIOMotorClient
-from motor.core import AgnosticCollection
-from datetime import datetime, timezone, timedelta
-from pymongo.errors import PyMongoError
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
-from discord.ext import commands
-from pymongo import UpdateOne
-
-
-REGEX_MATCH_START = re.compile(
-    r"\["
-    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}"
-    r"\]"
-    r"\["
-    r"\d+"
-    r"\]"
-    r"LogWorld: Bringing World .+ up for play \(max tick rate \d+\) at "
-    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}"
-)
-
-REGEX_MATCH_END = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
-    r"\]\["
-    r"(\d+)"
-    r"\]"
-    r"LogGameState: Match State Changed from InProgress to WaitingPostMatch"
-)
-
-REGEX_CONNECT = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
-    r"\]\["
-    r"(\d+)"
-    r"\]"
-    r"LogSquad: PostLogin: NewPlayer: "
-    r"([\w_]+)"
-    r" "
-    r"([^\s]+)"
-    r" \(IP: (\d{1,3}(?:\.\d{1,3}){3}) \| Online IDs: EOS: ([a-f0-9]+) steam: (\d+)\)"
-)
-
-REGEX_DISCONNECT = re.compile(
-    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3}\]"
-    r"\[\d+\]"
-    r"LogNet: UChannel::Close: Sending CloseBunch.*"
-    r"UniqueId: RedpointEOS:([a-f0-9]+)"
-)
-
-REGEX_WALLHACK = re.compile(
-    r"\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d+]\[\d+]"
-    r".*?SATAntiCheat:"
-    r"\s+(?P<player>.+?)\s+"
-    r"suspected of cheating:"
-    r"\s+(?P<cheat>WallHack! Keep an eye on him)"
-    r"\.\s+Reported\s+by:\s+(?P<reporter>.+)"
-)
-
-REGEX_INFINITEAMMO = re.compile(
-    r"\["
-    r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d+]\[\d+]"
-    r".*?SATAntiCheat:"
-    r"\s+(?P<player>.+?)\s+"
-    r"suspected of cheating:"
-    r"\s+(?P<cheat>"
-    r"InfiniteAmmo\(a\))\s+\.\s+"
-    r" Reported\s+by:\s+(?P<reporter>.+)"
-)
-
-REGEX_VEHICLE = re.compile(
-    r"\["
-    r"(\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\d{3})"
-    r"\]\["
-    r"\d+"
-    r"\]"
-    r"LogSquadTrace: \[DedicatedServer\]ASQPlayerController::OnPossess\(\): PC=([^\s]+)"
-    r" \(.*steam: (\d+)\).*Pawn=(BP_[A-Za-z0-9_]+)"
-)
-
-REGEX_KILL = re.compile(
-    r"\[.*\]LogSquad: Player: .*? from ([^\s]+) \(.*steam: (\d+).*?caused by ([^\s]+)"
-)
-
-IGNORED_ROLE_PATTERNS = [
-    r"BP_DeveloperAdminCam",
-    r"GE_USMC_Recruit",
-    r"_sl_",
-    r"_rifleman",
-    r"_slcrewman",
-    r"_unarmed",
-    r"_crewman",
-    r"_Crew",
-    r"UAFI_Recruit",
-    r"_hat",
-    r"_engineer",
-    r"HEZ_Recruit",
-    r"ADF_Recruit_GE",
-    r"_marksman",
-    r"_ar",
-    r"GE_RGF_Recruit",
-    r"BD_Recruit",
-    r"_sniper",
-    r"_lat",
-    r"_medic",
-    r"WAGPMC_Recruit",
-    r"GE_RNI_Recruit",
-    r"RUSOF_Scout_01",
-    r"USSF_Recruit",
-    r"PLA_Recruit_GE",
-    r"UAF_Recruit",
-    r"PLF_Recruit",
-    r"IGF_Recruit",
-    r"CAF_Recruit_GE",
-    r"IDF_Recruit",
-    r"_grenadier",
-    r"_slpilot",
-    r"TSF_Recruit",
-    r"_pilot",
-    r"_AT",
-    r"_Recruit",
-    r"_Rifleman1"
-]
-
-RIFLE_WEAPONS = {
-    "AK-74": re.compile(r"AK-?74(?:M|N)?", re.IGNORECASE),
-    "AK-74U": re.compile(r"AK-?74U", re.IGNORECASE),
-    "AK-105": re.compile(r"BP_AK105_Tan_1P87"),
-    "AKM": re.compile(r"AKM|AKMS", re.IGNORECASE),
-    "RPK": re.compile(r"RPK(?:-74)?", re.IGNORECASE),
-    "PKM": re.compile(r"\bPKM\b", re.IGNORECASE),
-    "PKP": re.compile(r"\bPKP\b", re.IGNORECASE),
-    "SVD": re.compile(r"\bSVD\b", re.IGNORECASE),
-    "M4": re.compile(r"M4(?:A1)?", re.IGNORECASE),
-    "M249": re.compile(r"M249(?: SAW)?", re.IGNORECASE),
-    "M240": re.compile(r"M240(?:B)?", re.IGNORECASE),
-    "M110": re.compile(r"M110", re.IGNORECASE),
-    "G36": re.compile(r"G36(?:[A-Z]*)?", re.IGNORECASE),
-    "FAMAS": re.compile(r"FAMAS", re.IGNORECASE),
-    "C7": re.compile(r"C7(?:A1)?", re.IGNORECASE),
-    "C8": re.compile(r"C8(?:A3)?", re.IGNORECASE),
-    "L85": re.compile(r"L85(?:A2)?", re.IGNORECASE),
-    "Minimi": re.compile(r"Minimi", re.IGNORECASE),
-    "MG3": re.compile(r"\bMG3\b", re.IGNORECASE),
-    "HK417": re.compile(r"HK417", re.IGNORECASE),
-    "QBZ": re.compile(r"QBZ(?:-95|95-1)?", re.IGNORECASE),
-    "QBU": re.compile(r"QBU-88", re.IGNORECASE),
-    "RPG-7": re.compile(r"RPG-7", re.IGNORECASE),
-    "Carl Gustav": re.compile(r"Carl\s*Gustav", re.IGNORECASE),
-    "AT4": re.compile(r"AT4", re.IGNORECASE),
-    "Panzerfaust": re.compile(r"Panzerfaust", re.IGNORECASE),
-    "MATADOR": re.compile(r"MATADOR", re.IGNORECASE),
-    "LAW": re.compile(r"LAW", re.IGNORECASE),
-    "Grenade": re.compile(r"(Grenade|Frag)", re.IGNORECASE),
-    "Smoke": re.compile(r"Smoke\s*Grenade", re.IGNORECASE),
-    "Binoculars": re.compile(r"Binoculars", re.IGNORECASE),
-    "Knife": re.compile(r"Knife", re.IGNORECASE),
-}
-
-vehicle_mapping = {
-    "BP_LAV25_Turret_Woodland": "LAV-25",
-    "BP_M1128_Woodland": "M1128",
-    "BP_M1128_Turret_Woodland": "M1128",
-    "BP_BTR82A_turret_desert": "БТР-82А",
-    "BP_Tigr_Desert": "Тигр",
-    "BP_Tigr_RWS_Desert": "Тигр RWS",
-    "BP_T72B3_Turret": "Т-72Б3",
-    "BP_Kord_Cupola_Turret": "Корд ",
-    "BP_T72B3_Green_GE_WAGNER": "Т-72Б3",
-    "BP_BMD4M_Turret_Desert": "БМД-4М",
-    "BP_CROWS_Woodland_M1A2": "M1A2",
-    "BP_M1126_Woodland": "M112",
-    "BP_CROWS_Stryker": "Страйкер",
-    "BP_BFV_Turret_BLACK": "BFV Турель",
-    "BP_SHILKA_Turret_Child": "Шилка Турель",
-    "BP_T90A_Turret_Desert": "Т-90А Турель",
-    "BP_MATV_MINIGUN_WOODLAND": "MATV с Мини-Ганом",
-    "SQDeployableChildActor_GEN_VARIABLE_BP_EmplacedKornet_Tripod_C": "Коорнет на Треноге",
-    "BP_Quadbike_Woodland": "Квадроцикл",
-    "BP_UAZ_PKM": "УАЗ с ПКМ",
-    "BP_BTR_Passenger": "БТР",
-    "BP_Kamaz_5350_Logi": "Камаз 5350",
-    "BP_BMP2_Passenger_DualViewport": "БМП-2",
-    "BP_Tigr": "Тигр",
-    "BP_UAZ_SPG9": "УАЗ с СПГ9",
-    "BP_Kamaz_5350_Logi_Desert": "Камаз 5350",
-    "BP_Technical_Turret_PKM": "Техническая Турель с ПКМ",
-    "BP_Technical_Turret_Kornet": "Турель с Корнетом",
-    "BP_Aussie_Util_Truck_Logi": "Австралийский Транспорт)",
-    "BP_Tigr_Kord_Turret_Desert": "Тигр с Турелью Корд",
-    "BP_RHIB_Turret_M134": "RHIB Турель с M134",
-    "BP_LAV25_Woodland": "LAV-25",
-    "BP_CPV_Transport": "CPV",
-    "BP_CPV_Turret_M134_FullRotation": "CPV Турель M134)",
-    "BP_CPV_M134": "CPV с M134",
-    "BP_BTR82A_RUS": "БТР-82А",
-    "BP_BTR82A_turret": "БТР-82А",
-    "BP_BTR80_RUS": "БТР-80",
-    "BP_BTR80_RUS_turret": "БТР-80",
-    "BP_UAZ_JEEP": "УАЗ",
-    "SQDeployableChildActor_GEN_VARIABLE_BP_ZiS3_Base_C": "ЗиС-3",
-    "BP_Tigr_Kord_Turret": "Тигр с пулеметом Корд",
-    "BP_M1A1_USMC_Turret_Woodland": "M1A1",
-    "BP_M60T_Turret_WPMC": "M60",
-    "BP_UAFI_Rifleman1": "Rifleman",
-    "SQDeployableChildActor_GEN_VARIABLE_BP_EmplacedSPG9_TripodScope_C": "SPG9 на Треноге",
-    "BP_Technical4Seater_Transport_Black": "Техническая",
-    "BP_Technical4Seater_Logi_Green": "Техническая",
-    "BP_LAV25_Commander": "LAV-25 ",
-    "BP_Technical4Seater_Transport_Camo": "Техническая",
-    "BP_Technical4Seater_Logi_Camo": "Техническая",
-    "BP_M60T_WPMC": "M60T WPMC",
-    "BP_BTR82A_RUS_Desert": "БТР-82А",
-    "BP_BTR80_RUS_Periscope_Desert": "БТР-80",
-    "BP_Shilka_AA": "Шилка ПВО",
-    "BP_UAF_Crew": "UAF ",
-    "BP_BTRMDM_PKT_RWS": "БТР-МДМ",
-    "BP_BMD4M_Turret": "БМД-4М",
-    "BP_BMP2M_Child_GE_WAGNER": "БМП-2М ",
-    "BP_UAF_AT": "UAF",
-    "BP_UAF_Pilot": "UAF",
-    "BP_BFV_Turret_Woodland": "BFV ",
-    "BP_CROWS_Turret_Woodland": "CROWS",
-    "BP_BFV_Woodland": "BFV",
-    "BP_KORD_Doorgun_Turret_L_TESTING": "Корд",
-    "BP_BTR80_RUS_Periscope": "БТР-80",
-    "BP_UAZ_VAN": "УАЗ Фургон",
-    "BP_FMTV_ARMED_LOGI_Black_del": "FMTV",
-    "BP_M1151_M240_Turret_Child_Black": "M1151 М240",
-    "BP_VehicleFAB500_CannonSAT": "Бегемот FAB-500",
-    "BP_BMD4M": "БМД-4М",
-    "BP_BFV": "BFV",
-    "BP_BFV_Turret": "BFV",
-    "BP_M1126": "M1126",
-    "BP_MTLB_FAB500_SATP": "МТЛБ с FAB-500(Бегемот)",
-    "BP_UAF_Rifleman2": "Rifleman 2",
-    "BP_UAF_Rifleman3": "Rifleman 3",
-    "BP_FV432_RWS_M2_Woodland": "FV432",
-    "BP_Minsk_black": "Минск",
-    "BP_Minsk_blue": "Минск",
-    "BP_Technical4Seater_Transport_Tan": "Техническая",
-    "BP_KORD_Doorgun_Turret_R_TESTING": "Корд",
-    "BP_BMP1_PLF": "БМП-1",
-    "BP_M1A2_Woodland": "M1A2",
-    "BP_M1A2_Turret_Woodland": "M1A2",
-    "BP_M134_Turret_Woodland": "M134",
-    "BP_M113A3_MK19": "M113A",
-    "BP_M113A3_OpenTurret_Mk19_Turret": "M113A3",
-    "BP_CROWS_Turret_TEST_Child": "CROWS",
-    "BP_BFV_CmdrScope_Woodland": "BFV",
-    "BP_FMTV_ARMED_LOGI_GREENWOODLAND_US": "FMTV",
-    "BP_M113A3": "M113A3",
-    "BP_BFV_Black": "BFV",
-    "BP_MATV_MINIGUN": "MATV",
-    "BP_M1A2_Turret": "M1A2",
-    "BP_M1128_Turret": "M1128",
-    "BP_M1A2": "M1A2",
-    "BP_LAV25": "LAV-25",
-    "BP_BMD4M_Commander_Periscope": "БМД-4М",
-    "BP_BMP2M_Commander_Periscope": "БМП-2М",
-    "BP_BMP2M_Turret": "БМП-2М",
-    "BP_T62": "Т-62",
-    "BP_T62_Turret": "Т-62",
-    "BP_Technical2Seater_White_Kornet": "Техническая",
-    "BP_Technical4Seater_Logi_Black": "Техническая)",
-    "BP_Arbalet_Turret": "Арбалет",
-    "BP_BMP2_IMF": "БМП-2",
-    "BP_UAZJEEP_Turret_PKM": "УАЗ",
-    "BP_Ural_4320_logi": "Урал 4320",
-    "BP_M1151_Turret": "M1151",
-    "BP_MRAP_Cougar_M2": "MRAP",
-    "BP_M1151_M240_Turret": "M1151 ",
-    "BP_FlyingDrone_VOG_Nade": "Беспилотник с VOG",
-    "BP_ZTZ99_wCage": "ZTZ99",
-    "BP_2A6_Turret_Desert": "2А6 Турель",
-    "BP_LAV25_Pintle_Turret_Woodland": "LAV25",
-    "BP_AAVP7A1_Woodland_Logi": "AAVP7A1",
-    "BP_M256A1_AP": "M256A1",
-}
-
-SERVERS = [
-    {
-        "name": "ZAVOD1",
-        "logFilePath":
-            "C:\\SquadServer\\ZAVOD1\\SquadGame\\Saved\\Logs\\SquadGame.log",
-        "mongo_uri": "mongodb://localhost:27017/",
-        "db_name": "SquadJS",
-        "collection_name": "Player",
-        "onl_stats_collection_name": "onl_stats",
-        "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039,
-        "discord_wallhack_channel_id": 1371128767790973010,
-        "discord_infiniteammo_channel_id": 1371128863974756482,
-        "vehicle_dis_id": 1371128423073845380,
-        "report_channel_id": 1371129252287742054,
-    },
-    {
-        "name": "ZAVOD2",
-        "logFilePath":
-            "C:\\SquadServer\\ZAVOD2\\SquadGame\\Saved\\Logs\\SquadGame.log",
-        "mongo_uri": "mongodb://localhost:27017/",
-        "db_name": "SquadJS",
-        "collection_name": "Player",
-        "onl_stats_collection_name": "onl_stats",
-        "matches_collection_name": 'matches',
-        "discord_channel_id": 1368641402816299039,
-        "discord_wallhack_channel_id": 1371128767790973010,
-        "discord_infiniteammo_channel_id": 1371128863974756482,
-        "vehicle_dis_id": 1371128665932300418,
-        "report_channel_id": 1371129252287742054,
-    }
-
-]
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -493,17 +162,25 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
             logging.warning(f"Активный матч не найден на сервере {server['name']}")
             return
 
-        existing_players = match.get("players", [])
-        for player in existing_players:
-            if player.get("steam_id") == steam_id:
-                await match_collection.update_one(
-                    {'_id': match["_id"], "players.steam_id": steam_id},
-                    {"$set": {"players.$.last_active": datetime.now(timezone.utc)}}
-                )
-                logging.debug(f"Обновлен last_active игрока {steam_id} на сервере {server['name']}")
-                return False
+        # Поиск существующего игрока
+        existing_player = next(
+            (p for p in match.get("players", []) if p.get("steam_id") == steam_id),
+            None
+        )
 
-        # Формируем данные игрока
+        if existing_player:
+            # Обновляем существующего игрока
+            await match_collection.update_one(
+                {"_id": match["_id"], "players.steam_id": steam_id},
+                {"$set": {
+                    "players.$.last_active": datetime.now(timezone.utc),
+                    "players.$.name": player_name or existing_player.get("name", "")
+                }}
+            )
+            logging.debug(f"Обновлен last_active игрока {steam_id} на сервере {server['name']}")
+            return False
+
+        # Формируем данные нового игрока
         player_data = {
             "steam_id": steam_id,
             "eos_id": eos_id,
@@ -515,18 +192,17 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
         # Добавляем игрока в матч
         result = await match_collection.update_one(
             {"_id": match["_id"]},
-            {"$addToSet": {"players": player_data}}
+            {"$push": {"players": player_data}}
         )
 
         if result.modified_count == 1:
             player_info = f"{player_name or 'Безымянный'} (SteamID: {steam_id})"
             logging.info(f"Игрок {player_info} добавлен на сервер {server['name']}")
-            await save_initial_stats(server, steam_id, eos_id)
+            await save_initial_stats(server, steam_id, eos_id, player_name)
             return True
 
         logging.debug(f"Игрок {steam_id} уже присутствует в матче на сервере {server['name']}")
         return False
-
 
     except Exception as e:
         logging.error(f"Ошибка при добавлении игрока {steam_id}: {str(e)}")
@@ -534,100 +210,131 @@ async def add_player_to_match(server, steam_id, eos_id=None, player_name=None):
 
 
 async def player_disconnect(server, eos_id):
-    if not eos_id or not isinstance(eos_id, str):
-        logging.error(f"Invalid EOS ID: {eos_id}")
-        return False
-
     try:
+        client = mongo_clients[server["name"]]
+        db = client[server["db_name"]]
+        players_col = db[server["collection_name"]]
         match_collection = await get_match_collection(server)
 
+        # Найти игрока по EOS ID
+        player_data = await players_col.find_one({"eosid": eos_id})
+        if not player_data:
+            logging.warning(f"Player not found for EOS ID: {eos_id}")
+            return False
+
+        steam_id = player_data["_id"]
+        player_name = player_data.get("name", "Unknown")
+
+        # Ищем активный матч
         active_match = await match_collection.find_one({
             "server_name": server["name"],
+            "active": True
         })
 
         if not active_match:
             return False
 
-        disconnect = active_match.get("disconnected_players", [])
-        if eos_id in disconnect:
-            logging.debug(f"Игрок {eos_id} уже находится в списке отключившихся {server['name']}")
-            return False
+        # Формируем запись игрока
+        player_entry = {
+            "steam_id": steam_id,
+            "eos_id": eos_id,
+            "name": player_name,
+            "join_time": datetime.now(timezone.utc),
+            "last_active": datetime.now(timezone.utc)
+        }
 
-        result = await match_collection.update_one(
+        # Обновляем матч: добавляем в disconnected_players и players
+        await match_collection.update_one(
             {"_id": active_match["_id"]},
             {
-                "$addToSet": {"disconnected_players": eos_id},
-                "$set": {"last_updated": datetime.now(timezone.utc)}
+                "$addToSet": {
+                    "disconnected_players": eos_id,
+                    "players": player_entry
+                }
             }
         )
 
-        if result.modified_count == 1:
-            return True
-
-        logging.warning(f"Не удалось зарегистрировать отключение для {eos_id} (возможный дубликат)")
-        return False
+        logging.info(f"Игрок добавлен в отключенные: {player_name} (EOS: {eos_id})")
+        return True
 
     except Exception as e:
-        logging.error(f"Ошибка обработки отключения для{eos_id}: {str(e)}")
+        logging.error(f"Error processing disconnect: {str(e)}")
         return False
+
+
+async def cleanup_disconnected_stats(server, match_id):
+    try:
+        client = mongo_clients.get(server["name"])
+        if not client:
+            return
+
+        db = client[server["db_name"]]
+        match_col = db[server["matches_collection_name"]]
+        onl_stats_col = db[server["onl_stats_collection_name"]]
+
+        # Получаем матч по ID
+        match = await match_col.find_one({"_id": match_id})
+        if not match:
+            return
+
+        # Получаем список EOS ID отключенных игроков
+        disconnected_eos = match.get("disconnected_players", [])
+        if not disconnected_eos:
+            return
+
+        # Найти Steam ID отключенных игроков
+        players_col = db[server["collection_name"]]
+        disconnected_players = await players_col.find(
+            {"eosid": {"$in": disconnected_eos}},
+            {"_id": 1}  # Получаем только Steam ID
+        ).to_list(length=None)
+
+        steam_ids = [p["_id"] for p in disconnected_players]
+
+        # Удалить из onl_stats
+        if steam_ids:
+            await onl_stats_col.delete_many({"_id": {"$in": steam_ids}})
+            logging.info(f"Удалено {len(steam_ids)} игроков из onl_stats")
+
+        # Удалить из players в матче
+        await match_col.update_one(
+            {"_id": match_id},
+            {"$pull": {"players": {"eos_id": {"$in": disconnected_eos}}}}
+        )
+        logging.info(f"Удалено игроков из списка players в матче")
+
+    except Exception as e:
+        logging.error(f"Ошибка при удалении отключённых игроков: {str(e)}")
 
 
 async def end_match(server):
     try:
         match_collection = await get_match_collection(server)
-
-        # Ищем активный матч (убрано дублирование find_one)
         match = await match_collection.find_one({
             "server_name": server["name"],
             "active": True
         })
 
         if not match:
-            logging.warning(f"Активный матч не найден: {server['name']}")
-            return False
-
-        # Проверяем, не завершен ли уже матч
-        if not match.get("active", True):
-            logging.warning(f"Матч {match['_id']} уже завершен")
             return False
 
         end_time = datetime.now(timezone.utc)
-        start_time = match["start_time"].replace(tzinfo=timezone.utc)
-
-        # Обновляем матч и проверяем результат
         result = await match_collection.update_one(
-            {"_id": match["_id"], "active": True},  # Добавлено условие для атомарности
-            {
-                "$set": {
-                    "active": False,
-                    "end_time": end_time
-                }
-            }
+            {"_id": match["_id"]},
+            {"$set": {"active": False, "end_time": end_time}}
         )
 
-        # Если не было изменений, выходим
         if result.modified_count == 0:
-            logging.warning(f"Матч {match['_id']} уже был завершен")
             return False
 
-        # Логируем и генерируем статистику
-        duration = (end_time - start_time).total_seconds() / 60
-        logging.info(f"Матч завершен: {server['name']} ({round(duration, 1)} мин.)")
-
-        # Добавляем защиту от повторного вызова
-        if not hasattr(end_match, "processed"):
-            end_match.processed = set()
-
-        await calculate_final_stats(server)
-
-        if match["_id"] not in end_match.processed:
-            end_match.processed.add(match["_id"])
-            asyncio.get_event_loop().call_later(100, end_match.processed.remove, match["_id"])  # Забыть через 5 минут
+        # Вызываем очистку после генерации статистики
+        await calculate_final_stats(server, match["_id"])
+        await asyncio.sleep(5)
+        await cleanup_disconnected_stats(server, match["_id"])
 
         return True
-
     except Exception as e:
-        logging.error(f"Ошибка завершения матча {server['name']}: {str(e)}", exc_info=True)
+        logging.error(f"Ошибка завершения матча: {str(e)}")
         return False
 
 
@@ -709,8 +416,8 @@ async def process_log_line(line, server):
         if match := REGEX_CONNECT.search(line):
             steam_id = match.group(7)
             eos_id = match.group(6)
-            player_name = match.group(5)  # Изменено с group(5) на group(3) для правильного имени
-            success = await add_player_to_match(server, steam_id, eos_id)
+            player_name = match.group(3)  # Изменено с group(5) на group(3) для правильного имени
+            success = await add_player_to_match(server, steam_id, eos_id, player_name)
             if success:
                 if success:
                     logging.debug(
@@ -731,7 +438,7 @@ async def process_log_line(line, server):
             reporter = match.group("reporter")
             message = (
                 f"🚨 **Обнаружен читер!**\n"
-                f"На сервере: {server_name['name']}"
+                f"На сервере: {server['name']}\n"
                 f"Игрок: `{player}`\n"
                 f"Чит: `{cheat}`\n"
                 f"Сообщил: `{reporter}`"
@@ -765,7 +472,7 @@ async def process_log_line(line, server):
             if len(recent_events) >= 10:
                 message = (
                     f"🔥 **Массовое использование InfiniteAmmo!**\n"
-                    f'На сервере: {server_name["name"]}\n'
+                    f'На сервере: {server['name']}\n'
                     f"Игрок: `{player}`\n"
                     f"Чит: `{cheat}`\n"
                     f"Сообщил: `{reporter}`\n"
@@ -840,7 +547,6 @@ async def process_log_line(line, server):
                     server,
                     attacker_name,
                     steam_id,
-                    "Rifle weapon",
                     weapon
                 )
                 times.clear()
@@ -951,9 +657,9 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
         now = datetime.now(timezone.utc)
 
         stats = {
-            "kills": player_data.get("kills", 0) if player_data else 0,
+            "kills": player_data.get("kills", 0),
             "revives": player_data.get("revives", 0) if player_data else 0,
-            "tech_kills": get_tech_kills(player_data.get("weapons", {})) if player_data else 0,
+            "tech_kills": get_tech_kills(player_data.get("weapons", {})),
             "timestamp": now,
             "eos": eos_id or player_data.get("eos") if player_data else None,
             "last_updated": now,
@@ -983,97 +689,11 @@ async def save_initial_stats(server: dict, steam_id: str, eos_id: str = None) ->
         return False
 
 
-async def remove_disconnected_players(server):
-    """Удаляет статистику по SteamID и игроков по EOSID с проверкой через Player"""
+async def calculate_final_stats(server: dict, match_id: ObjectId) -> None:
+    """Исправленный расчет финальной статистики"""
     try:
         server_name = server["name"]
-        client = mongo_clients.get(server_name)
-        if not client:
-            logging.error(f"MongoDB client not found: {server_name}")
-            return
-
-        db = client[server["db_name"]]
-        matches_col = db[server["matches_collection_name"]]
-        players_col = db[server["collection_name"]]
-        onl_stats_col = db[server["onl_stats_collection_name"]]
-
-        # 1. Получить завершенный матч
-        match = await matches_col.find_one(
-            {"server_name": server_name, "active": False},
-            projection={"disconnected_players": 1, "players": 1}
-        )
-        if not match:
-            logging.warning(f"No active match: {server_name}")
-            return
-
-        # 2. Получить EOSID для удаления
-        eos_to_process = match.get("disconnected_players", []).copy()
-        all_steam_ids_to_remove = set()
-
-        # 3. Удаление по EOSID из players
-        if eos_to_process:
-            # Найти записи в players с этими EOSID
-            players_to_delete = await matches_col.find_one(
-                {"_id": match["_id"], "players.eos_id": {"$in": eos_to_process}},
-                {"players.$": 1}
-            )
-
-            if players_to_delete:
-                # Собрать SteamID для удаления из onl_stats
-                steam_ids_from_eos = [p["steam_id"] for p in players_to_delete.get("players", [])]
-
-                # Удалить из players
-                await matches_col.update_one(
-                    {"_id": match["_id"]},
-                    {"$pull": {"players": {"eos_id": {"$in": eos_to_process}}}}
-                )
-
-                # Добавить SteamID для удаления из onl_stats
-                all_steam_ids_to_remove.update(steam_ids_from_eos)
-
-                # Убрать обработанные EOSID
-                eos_to_process = [eos for eos in eos_to_process
-                                  if eos not in {p["eos_id"] for p in players_to_delete.get("players", [])}]
-
-                # 4. Обработка оставшихся EOSID через коллекцию Player
-                if eos_to_process:
-                # Найти SteamID по EOSID в Player
-                    players_data = await players_col.find(
-                        {"eosid": {"$in": eos_to_process}},
-                        {"_id": 1, "eosid": 1}
-                    ).to_list(length=None)
-
-                # Собрать найденные SteamID
-                additional_steam_ids = [p["_id"] for p in players_data]
-
-                # Удалить записи из players по SteamID
-                if additional_steam_ids:
-                    await matches_col.update_one(
-                        {"_id": match["_id"]},
-                        {"$pull": {"players": {"steam_id": {"$in": additional_steam_ids}}}}
-                    )
-
-                # Добавить к общему списку для удаления из onl_stats
-                all_steam_ids_to_remove.update(additional_steam_ids)
-
-                # 5. Удалить из onl_stats по SteamID
-                if all_steam_ids_to_remove:
-                    await onl_stats_col.delete_many({"_id": {"$in": list(all_steam_ids_to_remove)}})
-                logging.info(f"[{server_name}] Удалено из onl_stats: {len(all_steam_ids_to_remove)}")
-
-    except Exception as e:
-        logging.error(f"Ошибка в remove_disconnected_players: {str(e)}")
-
-
-async def calculate_final_stats(server: dict) -> None:
-    """Вычисляет и сохраняет финальную статистику матча с учётом onl_stats"""
-    try:
-        server_name = server["name"]
-        logging.info(f'{server_name} расчет статы')
-
-        if not server_name:
-            logging.error("Не указано имя сервера в конфигурации")
-            return
+        logging.info(f'[{server_name}] Начало расчета финальной статистики для матча {match_id}')
 
         if not (client := mongo_clients.get(server_name)):
             logging.error(f"[{server_name}] MongoDB клиент недоступен")
@@ -1084,57 +704,99 @@ async def calculate_final_stats(server: dict) -> None:
         players_col = db[server["collection_name"]]
         onl_stats_col = db[server["onl_stats_collection_name"]]
 
-        server_players = await onl_stats_col.find(
-            {"server": server_name},
-            projection={"_id": 1}
+        # Получаем конкретный матч по ID
+        match = await matches_col.find_one({"_id": match_id})
+        if not match:
+            logging.warning(f"[{server_name}] Матч не найден (ID: {match_id})")
+            return
+
+        # Получаем всех игроков из матча
+        match_players = match.get("players", [])
+        if not match_players:
+            logging.warning(f"[{server_name}] Нет игроков в матче")
+            return
+
+        # Получаем уникальные Steam ID
+        steam_ids = list({p["steam_id"] for p in match_players})
+
+        # Получаем текущую статистику игроков
+        players_data = await players_col.find(
+            {"_id": {"$in": steam_ids}},
+            {"_id": 1, "name": 1, "kills": 1, "revives": 1, "weapons": 1}
         ).to_list(length=None)
 
-        if not server_players:
-            logging.warning(f"[{server_name}] Нет игроков с начальной статистикой для этого сервера")
-            return
+        # Получаем начальную статистику
+        onl_stats_data = await onl_stats_col.find(
+            {"_id": {"$in": steam_ids}},
+            {"_id": 1, "kills": 1, "revives": 1, "tech_kills": 1}
+        ).to_list(length=None)
 
-        player_ids = [p["_id"] for p in server_players]
-
-        match = await matches_col.find_one(
-            {"server_name": server_name, "active": False},
-            projection={"players": 1}
-        )
-
-        if not match:
-            logging.warning(f"[{server_name}] Активный матч не найден")
-            return
-
-        players = await players_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
-        onl_stats = await onl_stats_col.find({"_id": {"$in": player_ids}}).to_list(length=None)
-
-        onl_stats_dict = {stat["_id"]: stat for stat in onl_stats}
+        # Преобразуем в словари
+        players_dict = {p["_id"]: p for p in players_data}
+        onl_stats_dict = {s["_id"]: s for s in onl_stats_data}
 
         diffs = []
-        for player in players:
-            player_id = player["_id"]
-            initial_stats = onl_stats_dict.get(player_id, {})
+        now = datetime.now(timezone.utc)
 
-            logging.info(f'Измениние для игрока {player['_id']}')
-            if initial_stats.get("server") == server_name:
-                diff = await compute_diff(player, initial_stats)
-                diffs.append(diff)
+        # Вычисляем разницу статистики для каждого игрока
+        for steam_id in steam_ids:
+            player = players_dict.get(steam_id)
+            if not player:
+                continue
 
-        if not diffs:
-            logging.warning(f"[{server_name}] Нет данных для расчета разницы статистики")
-            return
+            initial_stats = onl_stats_dict.get(steam_id, {})
 
+            # Вычисляем технические убийства
+            tech_kills = get_tech_kills(player.get("weapons", {}))
+
+            # Рассчитываем пехотные убийства (общие минус техника)
+            infantry_kills = player.get("kills", 0) - tech_kills
+            initial_infantry = initial_stats.get("kills", 0)
+
+            # Вычисляем разницы
+            kills_diff = infantry_kills - initial_infantry
+            revives_diff = player.get("revives", 0) - initial_stats.get("revives", 0)
+            tech_diff = tech_kills - initial_stats.get("tech_kills", 0)
+
+            # Добавляем только положительные изменения
+            if kills_diff > 0 or revives_diff > 0 or tech_diff > 0:
+                diffs.append({
+                    "steam_id": steam_id,
+                    "name": player.get("name", "Unknown"),
+                    "kills_diff": max(kills_diff, 0),
+                    "revives_diff": max(revives_diff, 0),
+                    "tech_kills_diff": max(tech_diff, 0),
+                })
+
+        # Отправляем отчет
         await send_discord_report(diffs, server)
-        await asyncio.sleep(3)
-        await update_onl_stats(server)
-        await asyncio.sleep(5)
-        await remove_disconnected_players(server)
+
+        # Обновляем onl_stats текущими значениями
+        bulk_ops = []
+        for player in players_data:
+            tech_kills = get_tech_kills(player.get("weapons", {}))
+            infantry_kills = player.get("kills", 0) - tech_kills
+
+            bulk_ops.append(UpdateOne(
+                {"_id": player["_id"]},
+                {"$set": {
+                    "kills": infantry_kills,
+                    "revives": player.get("revives", 0),
+                    "tech_kills": tech_kills,
+                    "name": player.get("name", ""),
+                    "last_updated": now,
+                    "server": server_name
+                }}
+            ))
+
+        if bulk_ops:
+            await onl_stats_col.bulk_write(bulk_ops, ordered=False)
+            logging.info(f"[{server_name}] Обновлено {len(bulk_ops)} записей в onl_stats")
 
         logging.info(f"[{server_name}] Статистика успешно обработана для {len(diffs)} игроков")
 
-    except PyMongoError as e:
-        logging.error(f"[{server_name}] Ошибка MongoDB: {str(e)}")
     except Exception as e:
-        logging.error(f"[{server_name}] Системная ошибка: {str(e)}")
+        logging.error(f"[{server_name}] Ошибка расчета статистики: {str(e)}", exc_info=True)
 
 
 async def compute_diff(player: dict, initial: dict) -> dict:
@@ -1169,15 +831,14 @@ async def compute_diff(player: dict, initial: dict) -> dict:
 
 
 async def send_discord_report(diffs, server):
-    """Отправляет отчёт в Discord с разницей статистики"""
-
+    """Исправленная функция отправки отчетов в Discord"""
     try:
-        logging.info(f"{server['name']} Попытка отправки в диск")
+        logging.info(f"{server['name']} Попытка отправки в Discord")
         channel = bot.get_channel(server["discord_channel_id"])
         if not channel:
             logging.info(f"[{server['name']}] Discord канал недоступен")
             return
-        logging.info(f"{server["name"]} нашёл канал")
+
         # Основное сообщение
         await channel.send(f"📊 **Отчёт по изменению статистики на сервере {server['name']}**")
 
@@ -1188,61 +849,61 @@ async def send_discord_report(diffs, server):
             await channel.send("Нет значимых изменений статистики.")
             return
 
-        # Топ-3 по убийствам
-        if any(p["kills_diff"] > 0 for p in valid_diffs):
-            kills_sorted = sorted(valid_diffs, key=lambda x: x["kills_diff"], reverse=True)[:3]
-            kills_embed = discord.Embed(
-                title="🔫 Топ-3 по убийствам",
-                color=0xFF0000  # Красный
-            )
+        seen_players = set()
+        embeds_to_send = []
+
+        # Топ-3 по убийствам (пехотные)
+        kills_diffs = [p for p in valid_diffs if p["kills_diff"] > 0]
+        if kills_diffs:
+            kills_sorted = sorted(kills_diffs, key=lambda x: x["kills_diff"], reverse=True)[:3]
+            for p in kills_sorted:
+                seen_players.add(p['steam_id'])
+
+            kills_embed = discord.Embed(title="🔫 Топ-3 штурмовика", color=0xFF0000)
             for idx, player in enumerate(kills_sorted, 1):
                 kills_embed.add_field(
                     name=f"{idx}. {player['name']}",
                     value=f"Убийства: `{player['kills_diff']}`",
                     inline=False
                 )
-            await channel.send(embed=kills_embed)
+            embeds_to_send.append(kills_embed)
 
         # Топ-3 по воскрешениям
-        if any(p["revives_diff"] > 0 for p in valid_diffs):
-            revives_sorted = sorted(valid_diffs, key=lambda x: x["revives_diff"], reverse=True)[:3]
-            revives_embed = discord.Embed(
-                title="💉 Топ-3 медика ",
-                color=0x00FF00  # Зеленый
-            )
+        revives_diffs = [p for p in valid_diffs if p["revives_diff"] > 0 and p['steam_id'] not in seen_players]
+        if revives_diffs:
+            revives_sorted = sorted(revives_diffs, key=lambda x: x["revives_diff"], reverse=True)[:3]
+            for p in revives_sorted:
+                seen_players.add(p['steam_id'])
+
+            revives_embed = discord.Embed(title="💉 Топ-3 медика", color=0x00FF00)
             for idx, player in enumerate(revives_sorted, 1):
                 revives_embed.add_field(
                     name=f"{idx}. {player['name']}",
                     value=f"Воскрешений: `{player['revives_diff']}`",
                     inline=False
                 )
-            await channel.send(embed=revives_embed)
+            embeds_to_send.append(revives_embed)
 
         # Топ-3 по технике
-        if any(p["tech_kills_diff"] > 0 for p in valid_diffs):
-            tech_sorted = sorted(valid_diffs, key=lambda x: x["tech_kills_diff"], reverse=True)[:3]
-            tech_embed = discord.Embed(
-                title="🛠️ Топ-3 по техника",
-                color=0x0000FF  # Синий
-            )
+        tech_diffs = [p for p in valid_diffs if p["tech_kills_diff"] > 0 and p['steam_id'] not in seen_players]
+        if tech_diffs:
+            tech_sorted = sorted(tech_diffs, key=lambda x: x["tech_kills_diff"], reverse=True)[:3]
+
+            tech_embed = discord.Embed(title="🛠️ Топ-3 техника", color=0x0000FF)
             for idx, player in enumerate(tech_sorted, 1):
                 tech_embed.add_field(
                     name=f"{idx}. {player['name']}",
                     value=f"Убийств с техники: `{player['tech_kills_diff']}`",
                     inline=False
                 )
-            await channel.send(embed=tech_embed)
+            embeds_to_send.append(tech_embed)
 
-    except discord.errors.Forbidden:
-        logging.error(f"[{server['name']}] Ошибка доступа к каналу Discord")
-        return
+        # Отправляем все эмбеды
+        for embed in embeds_to_send:
+            await channel.send(embed=embed)
+
     except Exception as e:
         logging.error(f"[{server['name']}] Ошибка отправки отчёта: {str(e)}")
-        return
-
-    except Exception as e:
-        logging.error(f"Ошибка в sen_discord: {str(e)}")
-        raise
 
 
 COMPILED_IGNORED_ROLE_PATTERNS = tuple(re.compile(pat, re.IGNORECASE) for pat in IGNORED_ROLE_PATTERNS)
@@ -1268,10 +929,13 @@ FILTERED_VEHICLE_PATTERNS = get_filtered_vehicle_patterns()
 
 
 def get_tech_kills(weapons):
+    """Упрощенный подсчет убийств с техники"""
+    if not isinstance(weapons, dict):
+        return 0
+
     return sum(
         kills for weapon, kills in weapons.items()
-        if isinstance(weapon, str) and
-        any(pattern.search(weapon) for pattern in FILTERED_VEHICLE_PATTERNS.values())
+        if any(key in weapon for key in vehicle_mapping)
     )
 
 
@@ -1286,7 +950,7 @@ async def send_vehicle_message(server, player_name, steam_id, vehicle_name):
 
         channel_id = server.get('vehicle_dis_id')
         if not channel_id:
-            logging.error(f"Канал не найден в конфигурации сервера {server["name"]}")
+            logging.error(f"Канал не найден в конфигурации сервера {server['name']}")
             return
 
         channel = bot.get_channel(channel_id)
